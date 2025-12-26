@@ -31,17 +31,36 @@ rng = np.random.RandomState(SEED)
 try:
     # Create instance and load data
     dag_creator = CreateDAG(str(DATASET_PATH), row_index=TASK_ID) 
+        
+
+    a7 = np.array(dag_creator.a7_times, dtype=float)
+    a12 = np.array(dag_creator.a12_times, dtype=float)
+
+    print("min(a7), mean(a7), max(a7):", a7.min(), a7.mean(), a7.max())
+    print("min(a12), mean(a12), max(a12):", a12.min(), a12.mean(), a12.max())
+
+    # چند تا نود داریم که A12 سریع‌تر/کندتر است؟
+    print("count(a12 <= a7):", int(np.sum(a12 <= a7)), "/", len(a7))
+    print("count(a12 >  a7):", int(np.sum(a12 > a7)), "/", len(a7))
+
+    # چند نمونه از جاهایی که خلاف انتظار است
+    idx_bad = np.where(a12 > a7)[0][:10]
+    print("first bad idx (a12>a7):", idx_bad)
+    for i in idx_bad:
+        print(i, "a7=", a7[i], "a12=", a12[i])
+
     
     # Get required DAG components
     G = dag_creator.graph 
     
     exec_times = np.stack(
         [
-            np.array(dag_creator.a12_times, dtype=float),  # A7 (index 0, slower core) gets the slower original times
-            np.array(dag_creator.a7_times, dtype=float),   # A12 (index 1, faster core) gets the faster original times
+            np.array(dag_creator.a7_times, dtype=float),   # col 0 = A7
+            np.array(dag_creator.a12_times, dtype=float),  # col 1 = A12
         ],
         axis=1,
     )
+
     deadlines = np.array(dag_creator.deadlines, dtype=float)
 
 except FileNotFoundError:
