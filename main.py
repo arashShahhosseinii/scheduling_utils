@@ -4,13 +4,9 @@ from pathlib import Path
 import sys
 
 from Create_Dag import CreateDAG
-from scheduling_utils import (
-    compute_schedule_metrics,
-    schedule_random_A7_A12,
-    schedule_dual_A7,
-    schedule_dual_A12,
-    schedule_deadline_based_HEFT,
-)
+from Dag_Env import DagSchedulingEnv
+from scheduling_utils import run_policy_episode
+
 
 # --- 1) Initialization and Data Loading ---
 try:
@@ -24,51 +20,12 @@ TASK_ID = 0
 SEED = 42
 rng = np.random.RandomState(SEED)
 
-dag_creator = CreateDAG(str(DATASET_PATH), row_index=TASK_ID)
-G = dag_creator.graph
+# NOTE:
+# Env itself loads DAG from CSV. We create one CreateDAG here only if you want to sanity-check
+# but we will schedule inside env.
+# (Keeping it minimal and consistent with your previous logic.)
 
-# exec_times convention: col0=A7, col1=A12
-exec_times = np.stack(
-    [
-        np.array(dag_creator.a7_times, dtype=float),
-        np.array(dag_creator.a12_times, dtype=float),
-    ],
-    axis=1,
-)
-
-deadlines = np.array(dag_creator.deadlines, dtype=float)
-
-# energy matrix: col0=A7 energy, col1=A12 energy
-energy_mat = np.stack(
-    [
-        np.array(dag_creator.a7_energy, dtype=float),
-        np.array(dag_creator.a12_energy, dtype=float),
-    ],
-    axis=1,
-)
-
-num_tasks = G.number_of_nodes()
-
-
-def finish_dict_to_array(finish_dict):
-    return np.array([finish_dict[i] for i in sorted(finish_dict.keys())], dtype=float)
-
-
-def compute_total_energy(assigned_core_index: dict, processor_map: list) -> float:
-    """
-    assigned_core_index: task -> core_index
-    processor_map: core_index -> proc_type (0=A7,1=A12)
-    energy_mat: [task, proc_type] -> energy
-    """
-    total = 0.0
-    for t in range(num_tasks):
-        core_idx = assigned_core_index[t]
-        proc_type = processor_map[core_idx]
-        total += float(energy_mat[t, proc_type])
-    return total
-
-
-# --- 2) Execute Scheduling Algorithms ---
+# --- 2) Execute Scheduling Scenarios through Gymnasium Env ---
 results = {
     "Makespan": {},
     "Total_Tardiness": {},
@@ -76,35 +33,43 @@ results = {
 }
 
 scheduling_scenarios = {
-    "Dual A7 (Homogeneous)": (schedule_dual_A7, [0, 0]),
-    "Dual A12 (Homogeneous)": (schedule_dual_A12, [1, 1]),
-    "Random A7 + A12 (Heterogeneous)": (schedule_random_A7_A12, [0, 1]),
-    "HEFT A7 + A12 (Heterogeneous)": (schedule_deadline_based_HEFT, [0, 1]),
+    "Dual A7 (Homogeneous)": ([0, 0], "EDF"),
+    "Dual A12 (Homogeneous)": ([1, 1], "EDF"),
+    "Random A7 + A12 (Heterogeneous)": ([0, 1], "RANDOM"),
+    "HEFT A7 + A12 (Heterogeneous)": ([0, 1], "HEFT"),
 }
 
-for name, (scheduler_func, processor_map) in scheduling_scenarios.items():
-    print(f"Running scheduler: {name}...")
+for name, (processor_map, policy_name) in scheduling_scenarios.items():
+    print(f"Running (Gym) scheduler: {name} ...")
 
-    if "Random" in name:
-        assigned, start, finish = scheduler_func(G, exec_times, deadlines, rng)
+    env = DagSchedulingEnv(
+        csv_path=str(DATASET_PATH),
+        row_index=TASK_ID,
+        processor_map=processor_map,
+        # reward weights don't affect heuristic policies, but env is ready for RL:
+        reward_weights=(1.0, 1.0, 0.0),
+        invalid_action_penalty=1.0,
+        seed=SEED,
+    )
+
+    if policy_name == "RANDOM":
+        assigned, start, finish, metrics, total_reward = run_policy_episode(env, policy_name, rng=rng)
     else:
-        assigned, start, finish = scheduler_func(G, exec_times, deadlines)
+        assigned, start, finish, metrics, total_reward = run_policy_episode(env, policy_name, rng=None)
 
-    finish_array = finish_dict_to_array(finish)
-    makespan, total_tardiness = compute_schedule_metrics(finish_array, deadlines)
-    total_energy = compute_total_energy(assigned, processor_map)
+    makespan = metrics["makespan"]
+    total_tardiness = metrics["total_tardiness"]
+    total_energy = metrics["total_energy"]
 
     results["Makespan"][name] = makespan
     results["Total_Tardiness"][name] = total_tardiness
     results["Total_Energy"][name] = total_energy
 
-    # Makespan is still computed & printed, but will NOT be plotted
     print(
         f"   Makespan: {makespan:.2f}, "
         f"Total Tardiness: {total_tardiness:.2f}, "
         f"Total Energy: {total_energy:.2f}"
     )
-
 
 # --- 3) Plotting Results (Tardiness + Energy ONLY, in TWO separate figures) ---
 
@@ -134,7 +99,7 @@ fig1, ax1 = plt.subplots(figsize=(14, 7))
 rects_t = ax1.bar(x, tardinesses, width=0.6, label="Total Tardiness (Total Delay)")
 
 ax1.set_ylabel("Total Tardiness")
-ax1.set_title(f"Total Tardiness Comparison for DAG Task {TASK_ID}")
+ax1.set_title(f"Total Tardiness Comparison for DAG Task {TASK_ID} (Gym)")
 ax1.set_xticks(x)
 ax1.set_xticklabels(names, rotation=15, ha="right", fontsize=10)
 ax1.grid(axis="y", linestyle="--", alpha=0.6)
@@ -149,7 +114,7 @@ fig2, ax2 = plt.subplots(figsize=(14, 7))
 rects_e = ax2.bar(x, energies, width=0.6, label="Total Energy (Power × Time)")
 
 ax2.set_ylabel("Total Energy (Power × Time)")
-ax2.set_title(f"Total Energy Comparison for DAG Task {TASK_ID}")
+ax2.set_title(f"Total Energy Comparison for DAG Task {TASK_ID} (Gym)")
 ax2.set_xticks(x)
 ax2.set_xticklabels(names, rotation=15, ha="right", fontsize=10)
 ax2.grid(axis="y", linestyle="--", alpha=0.6)

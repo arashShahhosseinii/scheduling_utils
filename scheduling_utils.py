@@ -85,7 +85,7 @@ def _compute_upward_ranks(
     processor_map: List[int],
 ) -> np.ndarray:
     """
-    Real HEFT upward rank (communication cost assumed 0):
+    HEFT upward rank (comm cost assumed 0):
       rank_u(n) = avg_w(n) + max_{succ} rank_u(succ)
     avg_w(n) is mean execution time over processor types used.
     """
@@ -106,109 +106,87 @@ def _compute_upward_ranks(
     return rank_u
 
 
-def _schedule_parallel_dag(
-    G: nx.DiGraph,
-    exec_times: np.ndarray,
-    deadlines: np.ndarray,
-    processor_map: List[int],        # per-core type (0=A7,1=A12)
-    policy: str,                     # 'EDF', 'RANDOM', 'HEFT'
-    rng: Optional[np.random.RandomState] = None,
-) -> Tuple[Dict[int, int], Dict[int, float], Dict[int, float]]:
-    """
-    Returns:
-      assigned: task -> core_index (0..num_cores-1)
-      start: task -> start time
-      finish: task -> finish time
-    """
-    _validate_inputs(G, exec_times, deadlines, processor_map)
+# ------------------------------------------------------------
+# Policies that work on DagSchedulingEnv (Gymnasium env)
+# ------------------------------------------------------------
 
-    num_tasks = G.number_of_nodes()
-    num_cores = len(processor_map)
+def decode_action(action: int, num_cores: int) -> Tuple[int, int]:
+    task = int(action // num_cores)
+    core = int(action % num_cores)
+    return task, core
 
-    if policy == "RANDOM" and rng is None:
-        raise ValueError("rng must be provided for RANDOM policy")
 
-    rank_u = _compute_upward_ranks(G, exec_times, processor_map) if policy == "HEFT" else None
+def encode_action(task: int, core: int, num_cores: int) -> int:
+    return int(task * num_cores + core)
 
-    scheduled = np.zeros(num_tasks, dtype=bool)
-    core_intervals: List[List[Tuple[float, float, int]]] = [[] for _ in range(num_cores)]
 
-    assigned: Dict[int, int] = {}
-    start: Dict[int, float] = {}
-    finish: Dict[int, float] = {}
+def _ready_tasks_from_obs(obs: dict) -> List[int]:
+    ready_mask = obs["ready_mask"].astype(bool)
+    done_mask = obs["done_mask"].astype(bool)
+    return [i for i in range(len(ready_mask)) if ready_mask[i] and (not done_mask[i])]
 
-    def ready_time_of(task: int) -> float:
-        preds = list(G.predecessors(task))
-        return 0.0 if not preds else max(finish[p] for p in preds)
 
-    while not bool(scheduled.all()):
-        ready_tasks: List[int] = []
-        for t in range(num_tasks):
-            if scheduled[t]:
-                continue
-            preds = list(G.predecessors(t))
-            if all(scheduled[p] for p in preds):
-                ready_tasks.append(t)
+def choose_action_random(env, obs: dict, rng: np.random.RandomState) -> int:
+    ready = _ready_tasks_from_obs(obs)
+    if not ready:
+        # fallback: pick something (will be invalid -> penalty)
+        return 0
 
-        if not ready_tasks:
-            remaining = [i for i in range(num_tasks) if not scheduled[i]]
-            raise RuntimeError(f"No ready tasks found but unscheduled remain (e.g. {remaining[:10]}...).")
+    chosen_task = int(rng.choice(ready))
+    best_core = env.best_core_for_task(chosen_task)
+    return encode_action(chosen_task, best_core, env.num_cores)
 
-        # Choose task
-        if policy == "RANDOM":
-            chosen_task = int(rng.choice(ready_tasks))
-        elif policy == "EDF":
-            chosen_task = min(ready_tasks, key=lambda t: (deadlines[t], t))
-        elif policy == "HEFT":
-            chosen_task = max(ready_tasks, key=lambda t: (rank_u[t], -deadlines[t], -t))
+
+def choose_action_edf(env, obs: dict) -> int:
+    ready = _ready_tasks_from_obs(obs)
+    if not ready:
+        return 0
+
+    # EXACT tie-break as old code: min by (deadline, task_id)
+    chosen_task = min(ready, key=lambda t: (float(env.deadlines[t]), int(t)))
+    best_core = env.best_core_for_task(chosen_task)
+    return encode_action(chosen_task, best_core, env.num_cores)
+
+
+def choose_action_heft(env, obs: dict) -> int:
+    ready = _ready_tasks_from_obs(obs)
+    if not ready:
+        return 0
+
+    # EXACT tie-break as old code: max by (rank_u, -deadline, -task)
+    # env.rank_u_raw is the unnormalized rank
+    chosen_task = max(
+        ready,
+        key=lambda t: (float(env.rank_u_raw[t]), -float(env.deadlines[t]), -int(t)),
+    )
+    best_core = env.best_core_for_task(chosen_task)
+    return encode_action(chosen_task, best_core, env.num_cores)
+
+
+def run_policy_episode(env, policy_name: str, rng: Optional[np.random.RandomState] = None):
+    obs, info = env.reset()
+    terminated = False
+    truncated = False
+    total_reward = 0.0
+
+    while not (terminated or truncated):
+        if policy_name == "RANDOM":
+            if rng is None:
+                raise ValueError("rng must be provided for RANDOM policy")
+            action = choose_action_random(env, obs, rng)
+        elif policy_name == "EDF":
+            action = choose_action_edf(env, obs)
+        elif policy_name == "HEFT":
+            action = choose_action_heft(env, obs)
         else:
-            raise ValueError(f"Invalid policy: {policy}")
+            raise ValueError(f"Unknown policy_name: {policy_name}")
 
-        # Allocate by EFT
-        rt = ready_time_of(chosen_task)
-        best_core = -1
-        best_start = 0.0
-        best_finish = float("inf")
+        obs, reward, terminated, truncated, step_info = env.step(action)
+        total_reward += float(reward)
 
-        for core_idx in range(num_cores):
-            proc_type = processor_map[core_idx]  # 0 or 1
-            dur = float(exec_times[chosen_task, proc_type])
+        # if invalid action happens (shouldn't with our policies), continue; env handles penalty
+        info = step_info
 
-            s = _find_earliest_insertion_start(core_intervals[core_idx], rt, dur)
-            f = s + dur
-
-            if f < best_finish:
-                best_finish = f
-                best_core = core_idx
-                best_start = s
-
-        assigned[chosen_task] = best_core
-        start[chosen_task] = float(best_start)
-        finish[chosen_task] = float(best_finish)
-
-        core_intervals[best_core].append((float(best_start), float(best_finish), chosen_task))
-        core_intervals[best_core].sort(key=lambda x: x[0])
-
-        scheduled[chosen_task] = True
-
-    return assigned, start, finish
-
-
-def schedule_random_A7_A12(G: nx.DiGraph, exec_times: np.ndarray, deadlines: np.ndarray, rng: np.random.RandomState):
-    processor_map = [0, 1]  # core0=A7, core1=A12
-    return _schedule_parallel_dag(G, exec_times, deadlines, processor_map, policy="RANDOM", rng=rng)
-
-
-def schedule_dual_A7(G: nx.DiGraph, exec_times: np.ndarray, deadlines: np.ndarray):
-    processor_map = [0, 0]
-    return _schedule_parallel_dag(G, exec_times, deadlines, processor_map, policy="EDF")
-
-
-def schedule_dual_A12(G: nx.DiGraph, exec_times: np.ndarray, deadlines: np.ndarray):
-    processor_map = [1, 1]
-    return _schedule_parallel_dag(G, exec_times, deadlines, processor_map, policy="EDF")
-
-
-def schedule_deadline_based_HEFT(G: nx.DiGraph, exec_times: np.ndarray, deadlines: np.ndarray):
-    processor_map = [0, 1]
-    return _schedule_parallel_dag(G, exec_times, deadlines, processor_map, policy="HEFT")
+    assigned, start, finish = env.get_schedule()
+    metrics = env.get_metrics()
+    return assigned, start, finish, metrics, total_reward
