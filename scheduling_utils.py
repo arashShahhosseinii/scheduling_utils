@@ -1,11 +1,19 @@
 import networkx as nx
 import numpy as np
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, List, Optional
 
 
+# -----------------------------
+# Generic metric helper (optional)
+# -----------------------------
 def compute_schedule_metrics(
     finish_times: np.ndarray, deadlines: np.ndarray
 ) -> Tuple[float, float]:
+    """
+    Returns:
+      makespan = max(finish_times)
+      total_tardiness = sum(max(0, finish - deadline))
+    """
     if finish_times.size == 0:
         return 0.0, 0.0
 
@@ -15,6 +23,9 @@ def compute_schedule_metrics(
     return makespan, total_tardiness
 
 
+# -----------------------------
+# (Optional) kept to avoid breaking older code
+# -----------------------------
 def _validate_inputs(
     G: nx.DiGraph,
     exec_times: np.ndarray,
@@ -109,7 +120,6 @@ def _compute_upward_ranks(
 # ------------------------------------------------------------
 # Policies that work on DagSchedulingEnv (Gymnasium env)
 # ------------------------------------------------------------
-
 def decode_action(action: int, num_cores: int) -> Tuple[int, int]:
     task = int(action // num_cores)
     core = int(action % num_cores)
@@ -126,10 +136,10 @@ def _ready_tasks_from_obs(obs: dict) -> List[int]:
     return [i for i in range(len(ready_mask)) if ready_mask[i] and (not done_mask[i])]
 
 
+# ✅ RANDOM: Random task, but core chosen by EFT (best_core_for_task)
 def choose_action_random(env, obs: dict, rng: np.random.RandomState) -> int:
     ready = _ready_tasks_from_obs(obs)
     if not ready:
-        # fallback: pick something (will be invalid -> penalty)
         return 0
 
     chosen_task = int(rng.choice(ready))
@@ -142,7 +152,6 @@ def choose_action_edf(env, obs: dict) -> int:
     if not ready:
         return 0
 
-    # EXACT tie-break as old code: min by (deadline, task_id)
     chosen_task = min(ready, key=lambda t: (float(env.deadlines[t]), int(t)))
     best_core = env.best_core_for_task(chosen_task)
     return encode_action(chosen_task, best_core, env.num_cores)
@@ -153,8 +162,6 @@ def choose_action_heft(env, obs: dict) -> int:
     if not ready:
         return 0
 
-    # EXACT tie-break as old code: max by (rank_u, -deadline, -task)
-    # env.rank_u_raw is the unnormalized rank
     chosen_task = max(
         ready,
         key=lambda t: (float(env.rank_u_raw[t]), -float(env.deadlines[t]), -int(t)),
@@ -174,18 +181,18 @@ def run_policy_episode(env, policy_name: str, rng: Optional[np.random.RandomStat
             if rng is None:
                 raise ValueError("rng must be provided for RANDOM policy")
             action = choose_action_random(env, obs, rng)
+
         elif policy_name == "EDF":
             action = choose_action_edf(env, obs)
+
         elif policy_name == "HEFT":
             action = choose_action_heft(env, obs)
+
         else:
             raise ValueError(f"Unknown policy_name: {policy_name}")
 
         obs, reward, terminated, truncated, step_info = env.step(action)
         total_reward += float(reward)
-
-        # if invalid action happens (shouldn't with our policies), continue; env handles penalty
-        info = step_info
 
     assigned, start, finish = env.get_schedule()
     metrics = env.get_metrics()

@@ -3,7 +3,6 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
 
-from Create_Dag import CreateDAG
 from Dag_Env import DagSchedulingEnv
 from scheduling_utils import run_policy_episode
 
@@ -14,16 +13,11 @@ try:
 except NameError:
     SCRIPT_DIR = Path(sys.argv[0]).resolve().parent
 
-DATASET_PATH = SCRIPT_DIR / "dag_dataset_a7_a12.csv"
+DATASET_PATH = SCRIPT_DIR / "dag_dataset(1)_a7_a12.csv"
 
 TASK_ID = 0
 SEED = 42
 rng = np.random.RandomState(SEED)
-
-# NOTE:
-# Env itself loads DAG from CSV. We create one CreateDAG here only if you want to sanity-check
-# but we will schedule inside env.
-# (Keeping it minimal and consistent with your previous logic.)
 
 # --- 2) Execute Scheduling Scenarios through Gymnasium Env ---
 results = {
@@ -32,9 +26,10 @@ results = {
     "Total_Energy": {},
 }
 
+# ✅ Dualها فقط با HEFT
 scheduling_scenarios = {
-    "Dual A7 (Homogeneous)": ([0, 0], "EDF"),
-    "Dual A12 (Homogeneous)": ([1, 1], "EDF"),
+    "Dual A7 (Homogeneous, HEFT)": ([0, 0], "HEFT"),
+    "Dual A12 (Homogeneous, HEFT)": ([1, 1], "HEFT"),
     "Random A7 + A12 (Heterogeneous)": ([0, 1], "RANDOM"),
     "HEFT A7 + A12 (Heterogeneous)": ([0, 1], "HEFT"),
 }
@@ -46,12 +41,12 @@ for name, (processor_map, policy_name) in scheduling_scenarios.items():
         csv_path=str(DATASET_PATH),
         row_index=TASK_ID,
         processor_map=processor_map,
-        # reward weights don't affect heuristic policies, but env is ready for RL:
         reward_weights=(1.0, 1.0, 0.0),
         invalid_action_penalty=1.0,
         seed=SEED,
     )
 
+    # ✅ Random فقط یک بار اجرا می‌شود (بدون میانگین)
     if policy_name == "RANDOM":
         assigned, start, finish, metrics, total_reward = run_policy_episode(env, policy_name, rng=rng)
     else:
@@ -71,12 +66,10 @@ for name, (processor_map, policy_name) in scheduling_scenarios.items():
         f"Total Energy: {total_energy:.2f}"
     )
 
-# --- 3) Plotting Results (Tardiness + Energy ONLY, in TWO separate figures) ---
-
-names = list(results["Total_Tardiness"].keys())
-tardinesses = [results["Total_Tardiness"][n] for n in names]
+# --- 3) Plotting Results (Makespan + Energy ONLY, in TWO separate figures) ---
+names = list(results["Makespan"].keys())
+makespans = [results["Makespan"][n] for n in names]
 energies = [results["Total_Energy"][n] for n in names]
-
 x = np.arange(len(names))
 
 
@@ -94,19 +87,18 @@ def autolabel(ax, rects, fmt="{:.2f}"):
         )
 
 
-# -------- Figure 1: Total Tardiness --------
+# -------- Figure 1: Makespan --------
 fig1, ax1 = plt.subplots(figsize=(14, 7))
-rects_t = ax1.bar(x, tardinesses, width=0.6, label="Total Tardiness (Total Delay)")
+rects_m = ax1.bar(x, makespans, width=0.6, label="Makespan (Total Completion Time)")
 
-ax1.set_ylabel("Total Tardiness")
-ax1.set_title(f"Total Tardiness Comparison for DAG Task {TASK_ID} (Gym)")
+ax1.set_ylabel("Makespan")
+ax1.set_title(f"Makespan Comparison for DAG Task {TASK_ID} (Gym)")
 ax1.set_xticks(x)
 ax1.set_xticklabels(names, rotation=15, ha="right", fontsize=10)
 ax1.grid(axis="y", linestyle="--", alpha=0.6)
 ax1.legend(loc="upper right")
 
-autolabel(ax1, rects_t)
-
+autolabel(ax1, rects_m)
 fig1.tight_layout()
 
 # -------- Figure 2: Total Energy --------
@@ -121,7 +113,6 @@ ax2.grid(axis="y", linestyle="--", alpha=0.6)
 ax2.legend(loc="upper right")
 
 autolabel(ax2, rects_e)
-
 fig2.tight_layout()
 
 plt.show()
