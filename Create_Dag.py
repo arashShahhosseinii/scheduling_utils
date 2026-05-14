@@ -1,108 +1,179 @@
-import pandas as pd
 import ast
 import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Sequence, Tuple, Union
+
 import networkx as nx
-from typing import List, Tuple
+import pandas as pd
+
+
+def _clean_numpy_wrappers(value: str) -> str:
+    """Remove strings such as np.float64(1.2) before ast.literal_eval."""
+    value = re.sub(r"np\.float64\(([^)]+)\)", r"\1", value)
+    value = re.sub(r"np\.float32\(([^)]+)\)", r"\1", value)
+    value = re.sub(r"np\.int64\(([^)]+)\)", r"\1", value)
+    value = re.sub(r"np\.int32\(([^)]+)\)", r"\1", value)
+    return value
+
+
+@dataclass(frozen=True)
+class DAGRecord:
+    csv_path: str
+    row_index: int
+    num_subtasks: int
+    edges: List[Tuple[int, int]]
+    characteristics: List[Dict[str, Any]]
 
 
 class CreateDAG:
-    def __init__(self, csv_path: str, row_index: int = 0) -> None:
-        # 1) Read CSV and select one row (one DAG)
-        data_frame = pd.read_csv(csv_path)
-        row = data_frame.iloc[row_index]
+    """
+    Loads one DAG instance from your CSV format and exposes the fields needed by
+    the Gymnasium scheduler.
 
-        # 2) Number of subtasks (nodes)
-        self.num_subtasks: int = int(row["num_subtasks"])
+    Processor convention used everywhere in the project:
+      0 = A7
+      1 = A12
 
-        # 3) Parse edges
-        edges_str = str(row["edges"])
-        edges_list = ast.literal_eval(edges_str)
-        self.edges: List[Tuple[int, int]] = [(int(u), int(v)) for u, v in edges_list]
+    For the current phase we use the max-frequency entry for each processor type.
+    The full v_f_levels list is kept in self.v_f_levels for a later DVFS phase.
+    """
 
-        # 4) Build directed graph
-        G = nx.DiGraph()
-        G.add_nodes_from(range(self.num_subtasks))
-        G.add_edges_from(self.edges)
-        self.graph: nx.DiGraph = G
+    def __init__(self, csv_path: Union[str, Path], row_index: int = 0) -> None:
+        record = self.read_record(csv_path, row_index)
 
-        # 5) Parse node characteristics (clean np.float64(...) wrappers)
-        chars_str = str(row["characteristics"])
-        chars_str = re.sub(r"np\.float64\(([^)]+)\)", r"\1", chars_str)
-        chars_str = re.sub(r"np\.int64\(([^)]+)\)", r"\1", chars_str)
+        self.csv_path = record.csv_path
+        self.row_index = record.row_index
+        self.num_subtasks = record.num_subtasks
+        self.edges = record.edges
+        self.characteristics = record.characteristics
 
-        chars_list = ast.literal_eval(chars_str)  # list length = num_subtasks
+        graph = nx.DiGraph()
+        graph.add_nodes_from(range(self.num_subtasks))
+        graph.add_edges_from(self.edges)
 
-        periods = [0.0] * self.num_subtasks
-        deadlines = [0.0] * self.num_subtasks
-        m_i_list = [0.0] * self.num_subtasks
-
-        # Times (col0=A7, col1=A12 will be built in main)
-        a7_times = [0.0] * self.num_subtasks
-        a12_times = [0.0] * self.num_subtasks
-
-        # Power
-        a7_power = [0.0] * self.num_subtasks
-        a12_power = [0.0] * self.num_subtasks
-
-        # Energy = Power * Time
-        a7_energy = [0.0] * self.num_subtasks
-        a12_energy = [0.0] * self.num_subtasks
-
-        # Optional: store selected frequencies for sanity-checking
-        a7_freq = [0.0] * self.num_subtasks
-        a12_freq = [0.0] * self.num_subtasks
-
-        for i, node_info in enumerate(chars_list):
-            periods[i] = float(node_info["period"])
-            deadlines[i] = float(node_info["implicit_deadline"])
-            m_i_list[i] = float(node_info["m_i"])
-
-            vf_levels = node_info.get("v_f_levels", None)
-            if vf_levels is None or len(vf_levels) == 0:
-                raise KeyError("Missing 'v_f_levels' in characteristics.")
-
-            # Choose the VF level with the highest frequency (in your dataset it's the last entry)
-            # To be robust, we compute argmax over (freq1 + freq2)
-            best_idx = max(
-                range(len(vf_levels)),
-                key=lambda k: float(vf_levels[k]["frequency_proc1"]) + float(vf_levels[k]["frequency_proc2"]),
+        if not nx.is_directed_acyclic_graph(graph):
+            raise ValueError(
+                f"The DAG in {csv_path}, row {row_index}, contains a cycle."
             )
-            vf = vf_levels[best_idx]
 
-            # IMPORTANT (based on your CSV):
-            # proc1 is the faster core (higher frequency) => A12
-            # proc2 is the slower core => A7
-            t_a12 = float(vf["utilization_proc1_vf"])
-            t_a7 = float(vf["utilization_proc2_vf"])
+        self.graph = graph
 
-            p_a12 = float(vf["avg_total_power_proc1"])
-            p_a7 = float(vf["avg_total_power_proc2"])
+        self.periods: List[float] = []
+        self.deadlines: List[float] = []
+        self.m_i_list: List[float] = []
+        self.v_f_levels: List[List[Dict[str, Any]]] = []
 
-            a12_times[i] = t_a12
-            a7_times[i] = t_a7
+        self.a7_times: List[float] = []
+        self.a12_times: List[float] = []
 
-            a12_power[i] = p_a12
-            a7_power[i] = p_a7
+        self.a7_power: List[float] = []
+        self.a12_power: List[float] = []
 
-            a12_energy[i] = p_a12 * t_a12
-            a7_energy[i] = p_a7 * t_a7
+        self.a7_energy: List[float] = []
+        self.a12_energy: List[float] = []
 
-            a12_freq[i] = float(vf["frequency_proc1"])
-            a7_freq[i] = float(vf["frequency_proc2"])
+        self.a7_freq: List[float] = []
+        self.a12_freq: List[float] = []
 
-        # 6) Save attributes
-        self.periods = periods
-        self.deadlines = deadlines
-        self.m_i_list = m_i_list
+        self._parse_characteristics(record.characteristics)
 
-        self.a7_times = a7_times
-        self.a12_times = a12_times
+    @staticmethod
+    def read_record(csv_path: Union[str, Path], row_index: int = 0) -> DAGRecord:
+        csv_path = str(csv_path)
+        df = pd.read_csv(csv_path)
 
-        self.a7_power = a7_power
-        self.a12_power = a12_power
+        if row_index < 0 or row_index >= len(df):
+            raise IndexError(
+                f"row_index={row_index} is outside CSV length {len(df)} for {csv_path}."
+            )
 
-        self.a7_energy = a7_energy
-        self.a12_energy = a12_energy
+        row = df.iloc[row_index]
 
-        self.a7_freq = a7_freq
-        self.a12_freq = a12_freq
+        num_subtasks = int(row["num_subtasks"])
+
+        edges = [
+            (int(u), int(v))
+            for u, v in ast.literal_eval(str(row["edges"]))
+        ]
+
+        chars_str = _clean_numpy_wrappers(str(row["characteristics"]))
+        characteristics = ast.literal_eval(chars_str)
+
+        if len(characteristics) != num_subtasks:
+            raise ValueError(
+                f"Expected {num_subtasks} characteristic entries, "
+                f"got {len(characteristics)} in {csv_path}."
+            )
+
+        return DAGRecord(
+            csv_path=csv_path,
+            row_index=row_index,
+            num_subtasks=num_subtasks,
+            edges=edges,
+            characteristics=characteristics,
+        )
+
+    @staticmethod
+    def list_records(
+        csv_paths: Union[str, Path, Sequence[Union[str, Path]]]
+    ) -> List[Tuple[str, int]]:
+        """Return all (csv_path, row_index) pairs. Useful for multi-DAG PPO training."""
+
+        if isinstance(csv_paths, (str, Path)):
+            csv_paths = [csv_paths]
+
+        records: List[Tuple[str, int]] = []
+
+        for path in csv_paths:
+            path = str(path)
+            df = pd.read_csv(path)
+
+            for row_idx in range(len(df)):
+                records.append((path, row_idx))
+
+        if not records:
+            raise ValueError("No DAG records found.")
+
+        return records
+
+    def _parse_characteristics(self, characteristics: List[Dict[str, Any]]) -> None:
+        for node_info in characteristics:
+            self.periods.append(float(node_info.get("period", 1.0)))
+            self.deadlines.append(float(node_info["implicit_deadline"]))
+            self.m_i_list.append(float(node_info.get("m_i", 1.0)))
+
+            vf_levels = node_info.get("v_f_levels")
+
+            if not vf_levels:
+                raise KeyError("Missing non-empty 'v_f_levels' in characteristics.")
+
+            self.v_f_levels.append(vf_levels)
+
+            vf_a12 = max(
+                vf_levels,
+                key=lambda d: float(d["frequency_proc1"]),
+            )
+
+            vf_a7 = max(
+                vf_levels,
+                key=lambda d: float(d["frequency_proc2"]),
+            )
+
+            t_a12 = float(vf_a12["utilization_proc1_vf"])
+            t_a7 = float(vf_a7["utilization_proc2_vf"])
+
+            p_a12 = float(vf_a12["avg_total_power_proc1"])
+            p_a7 = float(vf_a7["avg_total_power_proc2"])
+
+            self.a12_times.append(t_a12)
+            self.a7_times.append(t_a7)
+
+            self.a12_power.append(p_a12)
+            self.a7_power.append(p_a7)
+
+            self.a12_energy.append(p_a12 * t_a12)
+            self.a7_energy.append(p_a7 * t_a7)
+
+            self.a12_freq.append(float(vf_a12["frequency_proc1"]))
+            self.a7_freq.append(float(vf_a7["frequency_proc2"]))

@@ -1,192 +1,262 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
 import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
 import networkx as nx
-from typing import Dict, List, Tuple, Optional
+import numpy as np
+from gymnasium import spaces
 
 from Create_Dag import CreateDAG
 
 
 class DagSchedulingEnv(gym.Env):
     """
-    A real DAG scheduling environment.
+    Gymnasium environment for heterogeneous DAG scheduling.
 
-    - Actions choose (task, core).
-    - The env performs actual list scheduling with insertion.
-    - Tracks assigned/start/finish, makespan, total tardiness, total energy.
-    - Provides action_mask for valid (task, core) pairs.
+    Action:
+      Discrete(max_tasks * num_cores), decoded as:
+        action = task * num_cores + core
+
+    Observation:
+      Dict with padded graph tensors:
+        node_features:    (max_tasks, 12)
+        edge_index:       (2, max_edges)
+        edge_mask:        (max_edges,)
+        node_mask:        (max_tasks,)
+        core_features:    (num_cores, 3)
+        global_features:  (6,)
+        action_mask:      (max_tasks * num_cores,)
+
+    In this version:
+      - GAT provides graph-based state encoding.
+      - PPO is the decision maker.
+      - Reward is dense and given at each step.
+      - Reward uses ONLY:
+          1. delta energy
+          2. delta makespan
+
+    Reward formula:
+      R_t = -(
+          0.5 * delta_energy / energy_scale
+        + 0.5 * delta_makespan / time_scale
+      )
+
+    Important:
+      Tardiness is NOT used in reward.
+      Tardiness is only kept as an evaluation metric if needed.
     """
 
     metadata = {"render_modes": ["human"]}
 
     def __init__(
         self,
-        csv_path: str,
+        csv_path: Optional[Union[str, Path]] = None,
         row_index: int = 0,
-        processor_map: Optional[List[int]] = None,  # per-core proc type: 0=A7, 1=A12
-        reward_weights: Tuple[float, float, float] = (1.0, 1.0, 0.0),  # (wE, wT, wM)
-        invalid_action_penalty: float = 1.0,
+        csv_paths: Optional[Sequence[Union[str, Path]]] = None,
+        dag_records: Optional[Sequence[Tuple[Union[str, Path], int]]] = None,
+        processor_map: Optional[List[int]] = None,
+        reward_weights: Tuple[float, float] = (0.5, 0.5),
+        invalid_action_penalty: float = 2.0,
+        max_tasks: Optional[int] = None,
+        max_edges: Optional[int] = None,
+        sample_dags: bool = True,
         seed: Optional[int] = None,
-    ):
+    ) -> None:
         super().__init__()
 
         if processor_map is None:
-            processor_map = [0, 1]  # default: one A7 + one A12
+            processor_map = [0, 1]
 
-        self.processor_map: List[int] = list(processor_map)
-        self.num_cores: int = len(self.processor_map)
+        self.processor_map = list(processor_map)
+        self.num_cores = len(self.processor_map)
 
-        self.wE, self.wT, self.wM = reward_weights
+        if self.num_cores <= 0:
+            raise ValueError("processor_map must contain at least one core.")
+
+        if any(p not in (0, 1) for p in self.processor_map):
+            raise ValueError("processor_map values must be 0=A7 or 1=A12.")
+
+        # reward_weights = (energy_weight, makespan_weight)
+        self.wE, self.wM = map(float, reward_weights)
+
         self.invalid_action_penalty = float(invalid_action_penalty)
+        self.sample_dags = bool(sample_dags)
+        self._initial_seed = seed
+        self.np_random = np.random.default_rng(seed)
 
-        # Load DAG from CSV row
-        self.dag = CreateDAG(csv_path, row_index=row_index)
-        self.G: nx.DiGraph = self.dag.graph
+        if dag_records is not None:
+            self.dag_records = [(str(p), int(i)) for p, i in dag_records]
+        elif csv_paths is not None:
+            self.dag_records = CreateDAG.list_records(csv_paths)
+        elif csv_path is not None:
+            self.dag_records = [(str(csv_path), int(row_index))]
+        else:
+            raise ValueError("Provide csv_path, csv_paths, or dag_records.")
 
-        if not nx.is_directed_acyclic_graph(self.G):
-            raise ValueError("Input graph is not a DAG (contains a cycle).")
+        sizes = []
+        edge_sizes = []
 
-        self.num_tasks: int = int(self.G.number_of_nodes())
-        nodes_sorted = sorted(self.G.nodes())
-        if nodes_sorted != list(range(self.num_tasks)):
-            raise ValueError(f"Graph nodes must be exactly 0..{self.num_tasks-1} (got {nodes_sorted[:10]}...).")
+        for path, idx in self.dag_records:
+            rec = CreateDAG.read_record(path, idx)
+            sizes.append(rec.num_subtasks)
+            edge_sizes.append(len(rec.edges))
 
-        # Convention everywhere:
-        # exec_times[:,0] = A7, exec_times[:,1] = A12
-        self.exec_times = np.stack(
-            [
-                np.array(self.dag.a7_times, dtype=np.float32),
-                np.array(self.dag.a12_times, dtype=np.float32),
-            ],
-            axis=1,
-        )  # shape: (N,2)
+        self.max_tasks = int(max_tasks or max(sizes))
+        self.max_edges = int(max_edges or max(max(edge_sizes), 1))
 
-        self.deadlines = np.array(self.dag.deadlines, dtype=np.float32)  # shape: (N,)
+        if self.max_tasks < max(sizes):
+            raise ValueError("max_tasks is smaller than at least one DAG.")
 
-        # energy_mat[:,0] = A7 energy, energy_mat[:,1] = A12 energy
-        self.energy_mat = np.stack(
-            [
-                np.array(self.dag.a7_energy, dtype=np.float32),
-                np.array(self.dag.a12_energy, dtype=np.float32),
-            ],
-            axis=1,
-        )  # shape: (N,2)
+        if self.max_edges < max(edge_sizes):
+            raise ValueError("max_edges is smaller than at least one DAG edge count.")
 
-        # Other optional node fields
-        self.periods = np.array(self.dag.periods, dtype=np.float32)
-        self.m_i = np.array(self.dag.m_i_list, dtype=np.float32)
+        self.node_feature_dim = 12
+        self.core_feature_dim = 3
+        self.global_feature_dim = 6
 
-        # Precompute HEFT rank_u for this processor_map (types used)
-        self.rank_u_raw = self._compute_upward_ranks(self.G, self.exec_times, self.processor_map).astype(np.float32)
-
-        # -------- Normalization scales for observation --------
-        # Upper bound-ish scale for time: max(deadline, N*max_exec)
-        max_dead = float(self.deadlines.max()) if self.deadlines.size else 1.0
-        max_exec = float(self.exec_times.max()) if self.exec_times.size else 1.0
-        self.time_scale = max(max_dead, self.num_tasks * max_exec, 1e-6)
-
-        max_energy = float(self.energy_mat.max()) if self.energy_mat.size else 1.0
-        self.energy_scale = max(max_energy, 1e-6)
-
-        max_period = float(self.periods.max()) if self.periods.size else 1.0
-        self.period_scale = max(max_period, 1e-6)
-
-        max_mi = float(self.m_i.max()) if self.m_i.size else 1.0
-        self.mi_scale = max(max_mi, 1e-6)
-
-        max_rank = float(self.rank_u_raw.max()) if self.rank_u_raw.size else 1.0
-        self.rank_scale = max(max_rank, 1e-6)
-
-        # -------- Observation features (node-wise) --------
-        # We'll expose (N,7):
-        # [period_norm, deadline_norm, m_i_norm, tA7_norm, tA12_norm, eA7_norm, eA12_norm]
-        self.node_features = np.stack(
-            [
-                (self.periods / self.period_scale),
-                (self.deadlines / self.time_scale),
-                (self.m_i / self.mi_scale),
-                (self.exec_times[:, 0] / self.time_scale),  # A7 time
-                (self.exec_times[:, 1] / self.time_scale),  # A12 time
-                (self.energy_mat[:, 0] / self.energy_scale),  # A7 energy
-                (self.energy_mat[:, 1] / self.energy_scale),  # A12 energy
-            ],
-            axis=1,
-        ).astype(np.float32)
-
-        self.rank_u = (self.rank_u_raw / self.rank_scale).astype(np.float32)
-
-        # -------- Spaces --------
-        # action = task * num_cores + core
-        self.action_space = spaces.Discrete(self.num_tasks * self.num_cores)
+        self.action_space = spaces.Discrete(self.max_tasks * self.num_cores)
 
         self.observation_space = spaces.Dict(
             {
                 "node_features": spaces.Box(
-                    low=0.0,
-                    high=1.0,
-                    shape=(self.num_tasks, 7),
+                    -np.inf,
+                    np.inf,
+                    shape=(self.max_tasks, self.node_feature_dim),
                     dtype=np.float32,
                 ),
-                "rank_u": spaces.Box(
-                    low=0.0,
-                    high=1.0,
-                    shape=(self.num_tasks,),
+                "edge_index": spaces.Box(
+                    0,
+                    self.max_tasks - 1,
+                    shape=(2, self.max_edges),
+                    dtype=np.int64,
+                ),
+                "edge_mask": spaces.MultiBinary(self.max_edges),
+                "node_mask": spaces.MultiBinary(self.max_tasks),
+                "core_features": spaces.Box(
+                    0.0,
+                    np.inf,
+                    shape=(self.num_cores, self.core_feature_dim),
                     dtype=np.float32,
                 ),
-                "done_mask": spaces.MultiBinary(self.num_tasks),
-                "ready_mask": spaces.MultiBinary(self.num_tasks),
-                "core_available": spaces.Box(
-                    low=0.0,
-                    high=1.0,
-                    shape=(self.num_cores,),
+                "global_features": spaces.Box(
+                    0.0,
+                    np.inf,
+                    shape=(self.global_feature_dim,),
                     dtype=np.float32,
                 ),
-                "action_mask": spaces.MultiBinary(self.num_tasks * self.num_cores),
+                "action_mask": spaces.MultiBinary(self.max_tasks * self.num_cores),
             }
         )
 
-        # -------- Internal state (reset each episode) --------
-        self.done_mask = np.zeros(self.num_tasks, dtype=bool)
-        self.ready_mask = np.zeros(self.num_tasks, dtype=bool)
+        self.dag: CreateDAG
+        self.G: nx.DiGraph
+        self.num_tasks = 0
+        self.edges: List[Tuple[int, int]] = []
 
-        self.assigned: Dict[int, int] = {}  # task -> core_idx
-        self.start: Dict[int, float] = {}
-        self.finish: Dict[int, float] = {}
+        self.exec_times = np.zeros((1, 2), dtype=np.float32)
+        self.energy_mat = np.zeros((1, 2), dtype=np.float32)
 
-        # For insertion scheduling per core: list of (start, finish, task)
-        self.core_intervals: List[List[Tuple[float, float, int]]] = [[] for _ in range(self.num_cores)]
-        self.core_available_time = np.zeros(self.num_cores, dtype=np.float32)
+        self.deadlines = np.ones(1, dtype=np.float32)
+        self.periods = np.ones(1, dtype=np.float32)
+        self.m_i = np.ones(1, dtype=np.float32)
+        self.rank_u_raw = np.ones(1, dtype=np.float32)
+
+        self.time_scale = 1.0
+        self.energy_scale = 1.0
+        self.period_scale = 1.0
+        self.mi_scale = 1.0
+        self.rank_scale = 1.0
+
+        self.done_mask: np.ndarray
+        self.ready_mask: np.ndarray
+        self.assigned: Dict[int, int]
+        self.start: Dict[int, float]
+        self.finish: Dict[int, float]
+
+        self.core_intervals: List[List[Tuple[float, float, int]]]
+        self.core_available_time: np.ndarray
 
         self.total_energy = 0.0
         self.total_tardiness = 0.0
         self.makespan = 0.0
+        self.steps = 0
 
-        # Seed
-        self._initial_seed = seed
+        self.current_record: Tuple[str, int] = self.dag_records[0]
+
         self.reset(seed=seed)
 
-    # ----------------- Core scheduling helpers -----------------
+    def _load_dag(self, record: Tuple[str, int]) -> None:
+        self.current_record = (str(record[0]), int(record[1]))
+
+        self.dag = CreateDAG(
+            self.current_record[0],
+            self.current_record[1],
+        )
+
+        self.G = self.dag.graph
+        self.edges = list(self.G.edges())
+        self.num_tasks = int(self.G.number_of_nodes())
+
+        self.exec_times = np.stack(
+            [
+                np.asarray(self.dag.a7_times, dtype=np.float32),
+                np.asarray(self.dag.a12_times, dtype=np.float32),
+            ],
+            axis=1,
+        )
+
+        self.energy_mat = np.stack(
+            [
+                np.asarray(self.dag.a7_energy, dtype=np.float32),
+                np.asarray(self.dag.a12_energy, dtype=np.float32),
+            ],
+            axis=1,
+        )
+
+        self.deadlines = np.asarray(self.dag.deadlines, dtype=np.float32)
+        self.periods = np.asarray(self.dag.periods, dtype=np.float32)
+        self.m_i = np.asarray(self.dag.m_i_list, dtype=np.float32)
+
+        self.rank_u_raw = self._compute_upward_ranks(
+            self.G,
+            self.exec_times,
+            self.processor_map,
+        ).astype(np.float32)
+
+        max_deadline = float(np.max(self.deadlines)) if self.deadlines.size else 1.0
+        max_exec = float(np.max(self.exec_times)) if self.exec_times.size else 1.0
+
+        self.time_scale = max(max_deadline, self.num_tasks * max_exec, 1e-6)
+        self.energy_scale = max(float(np.max(self.energy_mat)), 1e-6)
+        self.period_scale = max(float(np.max(self.periods)), 1e-6)
+        self.mi_scale = max(float(np.max(self.m_i)), 1e-6)
+        self.rank_scale = max(float(np.max(self.rank_u_raw)), 1e-6)
 
     @staticmethod
-    def _compute_upward_ranks(G: nx.DiGraph, exec_times: np.ndarray, processor_map: List[int]) -> np.ndarray:
-        """
-        HEFT upward rank (comm cost = 0):
-          rank_u(n) = avg_w(n) + max_{succ} rank_u(succ)
-        avg_w(n) is mean execution time over processor types used in processor_map.
-        """
+    def _compute_upward_ranks(
+        G: nx.DiGraph,
+        exec_times: np.ndarray,
+        processor_map: List[int],
+    ) -> np.ndarray:
         num_tasks = G.number_of_nodes()
         types_used = sorted(set(processor_map))
 
         avg_w = np.zeros(num_tasks, dtype=float)
-        for t in range(num_tasks):
-            avg_w[t] = float(np.mean(exec_times[t, types_used]))
 
-        topo = list(nx.topological_sort(G))
+        for task in range(num_tasks):
+            avg_w[task] = float(np.mean(exec_times[task, types_used]))
+
         rank_u = np.zeros(num_tasks, dtype=float)
 
-        for n in reversed(topo):
-            succs = list(G.successors(n))
-            rank_u[n] = avg_w[n] if not succs else (avg_w[n] + max(rank_u[s] for s in succs))
+        for node in reversed(list(nx.topological_sort(G))):
+            successors = list(G.successors(node))
+
+            if not successors:
+                rank_u[node] = avg_w[node]
+            else:
+                rank_u[node] = avg_w[node] + max(rank_u[s] for s in successors)
 
         return rank_u
 
@@ -196,204 +266,307 @@ class DagSchedulingEnv(gym.Env):
         ready_time: float,
         duration: float,
     ) -> float:
-        if duration < 0:
-            raise ValueError("duration must be non-negative")
-
         if not intervals:
-            return ready_time
+            return float(ready_time)
 
         intervals = sorted(intervals, key=lambda x: x[0])
+        candidate = float(ready_time)
 
-        # before first interval
-        s = ready_time
-        if s + duration <= intervals[0][0]:
-            return s
+        if candidate + duration <= intervals[0][0]:
+            return candidate
 
-        # gaps between intervals
         for i in range(len(intervals) - 1):
-            gap_start = max(ready_time, intervals[i][1])
-            gap_end = intervals[i + 1][0]
-            if gap_start + duration <= gap_end:
-                return gap_start
+            candidate = max(float(ready_time), intervals[i][1])
 
-        # after last interval
-        return max(ready_time, intervals[-1][1])
+            if candidate + duration <= intervals[i + 1][0]:
+                return candidate
+
+        return max(float(ready_time), intervals[-1][1])
 
     def ready_time_of(self, task: int) -> float:
         preds = list(self.G.predecessors(task))
+
         if not preds:
             return 0.0
+
         return float(max(self.finish[p] for p in preds))
 
     def estimate_start_finish(self, task: int, core_idx: int) -> Tuple[float, float]:
-        proc_type = self.processor_map[core_idx]  # 0=A7, 1=A12
-        dur = float(self.exec_times[task, proc_type])
+        proc_type = self.processor_map[core_idx]
+        duration = float(self.exec_times[task, proc_type])
+        ready_time = self.ready_time_of(task)
 
-        rt = self.ready_time_of(task)
-        s = self._find_earliest_insertion_start(self.core_intervals[core_idx], rt, dur)
-        f = s + dur
-        return float(s), float(f)
+        start = self._find_earliest_insertion_start(
+            self.core_intervals[core_idx],
+            ready_time,
+            duration,
+        )
+
+        return float(start), float(start + duration)
 
     def best_core_for_task(self, task: int) -> int:
-        """
-        EFT core selection (Earliest Finish Time).
-        Tie-breaking matches old logic: first core with strictly smaller finish wins.
-        """
         best_core = 0
         best_finish = float("inf")
-        for c in range(self.num_cores):
-            _, f = self.estimate_start_finish(task, c)
-            if f < best_finish:
-                best_finish = f
-                best_core = c
+
+        for core in range(self.num_cores):
+            _, finish = self.estimate_start_finish(task, core)
+
+            if finish < best_finish:
+                best_core = core
+                best_finish = finish
+
         return best_core
 
-    # ----------------- Masks / Observation -----------------
-
     def _update_ready_mask(self) -> None:
-        for t in range(self.num_tasks):
-            if self.done_mask[t]:
-                self.ready_mask[t] = False
-                continue
-            preds = list(self.G.predecessors(t))
-            self.ready_mask[t] = all(self.done_mask[p] for p in preds)
+        self.ready_mask[:] = False
 
-    def _compute_action_mask(self) -> np.ndarray:
-        # valid if task is ready and not done; any core allowed
-        mask = np.zeros(self.num_tasks * self.num_cores, dtype=np.int8)
         for task in range(self.num_tasks):
-            if self.ready_mask[task] and (not self.done_mask[task]):
-                base = task * self.num_cores
-                mask[base : base + self.num_cores] = 1
+            if self.done_mask[task]:
+                continue
+
+            self.ready_mask[task] = all(
+                self.done_mask[p]
+                for p in self.G.predecessors(task)
+            )
+
+    def _action_mask(self) -> np.ndarray:
+        mask = np.zeros(self.max_tasks * self.num_cores, dtype=np.int8)
+
+        for task in range(self.num_tasks):
+            if self.ready_mask[task] and not self.done_mask[task]:
+                for core in range(self.num_cores):
+                    mask[task * self.num_cores + core] = 1
+
         return mask
 
-    def _get_obs(self) -> Dict[str, np.ndarray]:
-        # core available normalized
-        core_av_norm = np.clip(self.core_available_time / self.time_scale, 0.0, 1.0).astype(np.float32)
-        action_mask = self._compute_action_mask()
+    def _node_features(self) -> np.ndarray:
+        x = np.zeros(
+            (self.max_tasks, self.node_feature_dim),
+            dtype=np.float32,
+        )
+
+        for task in range(self.num_tasks):
+            finish_norm = float(self.finish.get(task, 0.0)) / self.time_scale
+            start_norm = float(self.start.get(task, 0.0)) / self.time_scale
+
+            x[task] = np.asarray(
+                [
+                    self.periods[task] / self.period_scale,
+                    self.deadlines[task] / self.time_scale,
+                    self.m_i[task] / self.mi_scale,
+                    self.exec_times[task, 0] / self.time_scale,
+                    self.exec_times[task, 1] / self.time_scale,
+                    self.energy_mat[task, 0] / self.energy_scale,
+                    self.energy_mat[task, 1] / self.energy_scale,
+                    self.rank_u_raw[task] / self.rank_scale,
+                    float(self.done_mask[task]),
+                    float(self.ready_mask[task]),
+                    start_norm,
+                    finish_norm,
+                ],
+                dtype=np.float32,
+            )
+
+        return x
+
+    def _edge_index_and_mask(self) -> Tuple[np.ndarray, np.ndarray]:
+        edge_index = np.zeros((2, self.max_edges), dtype=np.int64)
+        edge_mask = np.zeros(self.max_edges, dtype=np.int8)
+
+        for k, (u, v) in enumerate(self.edges[: self.max_edges]):
+            edge_index[0, k] = int(u)
+            edge_index[1, k] = int(v)
+            edge_mask[k] = 1
+
+        return edge_index, edge_mask
+
+    def _obs(self) -> Dict[str, np.ndarray]:
+        self._update_ready_mask()
+
+        edge_index, edge_mask = self._edge_index_and_mask()
+
+        node_mask = np.zeros(self.max_tasks, dtype=np.int8)
+        node_mask[: self.num_tasks] = 1
+
+        core_features = np.zeros(
+            (self.num_cores, self.core_feature_dim),
+            dtype=np.float32,
+        )
+
+        for core, proc_type in enumerate(self.processor_map):
+            core_features[core] = np.asarray(
+                [
+                    float(proc_type),
+                    self.core_available_time[core] / self.time_scale,
+                    len(self.core_intervals[core]) / max(self.num_tasks, 1),
+                ],
+                dtype=np.float32,
+            )
+
+        global_features = np.asarray(
+            [
+                self.steps / max(self.num_tasks, 1),
+                float(np.sum(self.done_mask[: self.num_tasks])) / max(self.num_tasks, 1),
+                self.total_energy / max(self.energy_scale * self.num_tasks, 1e-6),
+                self.total_tardiness / self.time_scale,
+                self.makespan / self.time_scale,
+                float(np.sum(self.ready_mask[: self.num_tasks])) / max(self.num_tasks, 1),
+            ],
+            dtype=np.float32,
+        )
 
         return {
-            "node_features": self.node_features.copy(),
-            "rank_u": self.rank_u.copy(),
-            "done_mask": self.done_mask.astype(np.int8),
-            "ready_mask": self.ready_mask.astype(np.int8),
-            "core_available": core_av_norm,
-            "action_mask": action_mask,
+            "node_features": self._node_features(),
+            "edge_index": edge_index,
+            "edge_mask": edge_mask,
+            "node_mask": node_mask,
+            "core_features": core_features,
+            "global_features": global_features,
+            "action_mask": self._action_mask(),
         }
 
-    # ----------------- Gymnasium API -----------------
+    def reset(
+        self,
+        *,
+        seed: Optional[int] = None,
+        options: Optional[dict] = None,
+    ):
+        super().reset(seed=seed)
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed if seed is not None else self._initial_seed)
+        if seed is not None:
+            self.np_random = np.random.default_rng(seed)
 
-        self.done_mask[:] = False
-        self.ready_mask[:] = False
+        if self.sample_dags and len(self.dag_records) > 1:
+            idx = int(self.np_random.integers(0, len(self.dag_records)))
+            record = self.dag_records[idx]
+        else:
+            record = self.dag_records[0]
+
+        self._load_dag(record)
+
+        self.done_mask = np.zeros(self.max_tasks, dtype=bool)
+        self.ready_mask = np.zeros(self.max_tasks, dtype=bool)
 
         self.assigned = {}
         self.start = {}
         self.finish = {}
 
         self.core_intervals = [[] for _ in range(self.num_cores)]
-        self.core_available_time[:] = 0.0
+        self.core_available_time = np.zeros(self.num_cores, dtype=np.float32)
 
         self.total_energy = 0.0
         self.total_tardiness = 0.0
         self.makespan = 0.0
+        self.steps = 0
 
-        self._update_ready_mask()
+        obs = self._obs()
 
-        obs = self._get_obs()
-        info = {
-            "num_tasks": self.num_tasks,
-            "num_cores": self.num_cores,
-            "processor_map": self.processor_map,
+        return obs, {
+            "csv_path": self.current_record[0],
+            "row_index": self.current_record[1],
         }
-        return obs, info
 
     def step(self, action: int):
-        # Decode
-        task = int(action // self.num_cores)
-        core = int(action % self.num_cores)
+        action = int(action)
 
-        # Validate action
-        invalid = (
-            task < 0
-            or task >= self.num_tasks
-            or core < 0
-            or core >= self.num_cores
-            or self.done_mask[task]
-            or (not self.ready_mask[task])
+        task = action // self.num_cores
+        core = action % self.num_cores
+
+        valid = bool(
+            0 <= task < self.num_tasks
+            and 0 <= core < self.num_cores
+            and self.ready_mask[task]
+            and not self.done_mask[task]
         )
 
-        if invalid:
-            reward = -float(self.invalid_action_penalty)
-            terminated = False
-            truncated = False
-            info = {"invalid_action": True}
-            return self._get_obs(), reward, terminated, truncated, info
+        if not valid:
+            obs = self._obs()
 
-        # Schedule on chosen core with insertion
-        s, f = self.estimate_start_finish(task, core)
-
-        self.assigned[task] = core
-        self.start[task] = float(s)
-        self.finish[task] = float(f)
-
-        self.core_intervals[core].append((float(s), float(f), task))
-        self.core_intervals[core].sort(key=lambda x: x[0])
-
-        # update core available time (simple upper bound, not exact earliest gap)
-        self.core_available_time[core] = float(max(self.core_available_time[core], f))
-
-        # update masks
-        self.done_mask[task] = True
-        self._update_ready_mask()
-
-        # Metrics increments
-        proc_type = self.processor_map[core]
-        energy_inc = float(self.energy_mat[task, proc_type])
-        tard_inc = float(max(0.0, f - float(self.deadlines[task])))
-
-        self.total_energy += energy_inc
-        self.total_tardiness += tard_inc
-        self.makespan = float(max(self.makespan, f))
-
-        # Reward shaping
-        reward = -(self.wE * energy_inc + self.wT * tard_inc)
-
-        terminated = bool(self.done_mask.all())
-        truncated = False
-
-        info = {
-            "scheduled_task": task,
-            "scheduled_core": core,
-            "start": float(s),
-            "finish": float(f),
-            "energy_inc": energy_inc,
-            "tardiness_inc": tard_inc,
-        }
-
-        if terminated:
-            # Add final makespan penalty if wM > 0
-            reward -= float(self.wM * self.makespan)
-
-            info.update(
+            return (
+                obs,
+                -self.invalid_action_penalty,
+                False,
+                False,
                 {
-                    "makespan": float(self.makespan),
-                    "total_tardiness": float(self.total_tardiness),
-                    "total_energy": float(self.total_energy),
-                    "assigned": self.assigned.copy(),
-                    "start_times": self.start.copy(),
-                    "finish_times": self.finish.copy(),
-                }
+                    "invalid_action": True,
+                    "task": task,
+                    "core": core,
+                },
             )
 
-        return self._get_obs(), float(reward), terminated, truncated, info
+        prev_energy = self.total_energy
+        prev_makespan = self.makespan
 
-    # ----------------- Convenience -----------------
+        start, finish = self.estimate_start_finish(task, core)
 
-    def get_schedule(self) -> Tuple[Dict[int, int], Dict[int, float], Dict[int, float]]:
-        return self.assigned.copy(), self.start.copy(), self.finish.copy()
+        proc_type = self.processor_map[core]
+        energy = float(self.energy_mat[task, proc_type])
+
+        # Tardiness is calculated only as a metric.
+        # It is NOT used in the reward.
+        tardiness = max(0.0, finish - float(self.deadlines[task]))
+
+        self.assigned[task] = core
+        self.start[task] = start
+        self.finish[task] = finish
+
+        self.core_intervals[core].append((start, finish, task))
+        self.core_intervals[core].sort(key=lambda x: x[0])
+
+        self.core_available_time[core] = max(
+            self.core_available_time[core],
+            finish,
+        )
+
+        self.done_mask[task] = True
+        self.steps += 1
+
+        self.total_energy += energy
+        self.total_tardiness += tardiness
+        self.makespan = max(self.makespan, finish)
+
+        delta_energy = self.total_energy - prev_energy
+        delta_makespan = self.makespan - prev_makespan
+
+        # New reward:
+        # Only delta energy and delta makespan are used.
+        # Both coefficients are 0.5.
+        reward = -(
+            self.wE * delta_energy / max(self.energy_scale, 1e-6)
+            + self.wM * delta_makespan / max(self.time_scale, 1e-6)
+        )
+
+        terminated = bool(np.all(self.done_mask[: self.num_tasks]))
+        obs = self._obs()
+
+        info = {
+            "invalid_action": False,
+            "task": task,
+            "core": core,
+            "start": start,
+            "finish": finish,
+            "energy": energy,
+            "tardiness": tardiness,
+            "delta_energy": delta_energy,
+            "delta_makespan": delta_makespan,
+            "makespan": self.makespan,
+            "total_energy": self.total_energy,
+            "total_tardiness": self.total_tardiness,
+        }
+
+        return obs, float(reward), terminated, False, info
+
+    def get_schedule(self):
+        assigned = np.full(self.num_tasks, -1, dtype=int)
+        start = np.zeros(self.num_tasks, dtype=np.float32)
+        finish = np.zeros(self.num_tasks, dtype=np.float32)
+
+        for task in range(self.num_tasks):
+            assigned[task] = int(self.assigned.get(task, -1))
+            start[task] = float(self.start.get(task, 0.0))
+            finish[task] = float(self.finish.get(task, 0.0))
+
+        return assigned, start, finish
 
     def get_metrics(self) -> Dict[str, float]:
         return {
@@ -403,8 +576,10 @@ class DagSchedulingEnv(gym.Env):
         }
 
     def render(self):
-        done_nodes = [i for i, d in enumerate(self.done_mask) if d]
-        ready_nodes = [i for i, r in enumerate(self.ready_mask) if r]
-        print(f"Done (scheduled) tasks: {done_nodes}")
-        print(f"Ready tasks: {ready_nodes}")
-        print(f"Makespan: {self.makespan:.3f} | Tardiness: {self.total_tardiness:.3f} | Energy: {self.total_energy:.3f}")
+        print(
+            f"DAG={Path(self.current_record[0]).name}:{self.current_record[1]} "
+            f"steps={self.steps}/{self.num_tasks} "
+            f"makespan={self.makespan:.3f} "
+            f"energy={self.total_energy:.3f} "
+            f"tardiness={self.total_tardiness:.3f}"
+        )
