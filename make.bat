@@ -11,7 +11,7 @@ set ARTIFACT_DIR=artifacts
 set MODEL_DIR=artifacts\models
 set EVAL_DIR=artifacts\evaluation
 set LOG_DIR=artifacts\logs
-set MODEL_FILE=artifacts\models\ppo_gat_scheduler.zip
+set MODEL_FILE=artifacts\models\ppo_mlp_scheduler.zip
 
 if "%COMMAND%"=="run" goto run
 if "%COMMAND%"=="install" goto install
@@ -77,18 +77,18 @@ if not exist scheduling_utils.py (
     exit /b 1
 )
 
-if not exist "dag_dataset(1)_a7_a12.csv" (
-    echo ERROR: Missing dag_dataset(1)_a7_a12.csv
+if not exist "dag_dataset1_a7_a12.csv" (
+    echo ERROR: Missing dag_dataset1_a7_a12.csv
     exit /b 1
 )
 
-if not exist "dag_dataset(2)_a7_a12.csv" (
-    echo ERROR: Missing dag_dataset(2)_a7_a12.csv
+if not exist "dag_dataset2_a7_a12.csv" (
+    echo ERROR: Missing dag_dataset2_a7_a12.csv
     exit /b 1
 )
 
-if not exist "dag_dataset(3)_a7_a12.csv" (
-    echo ERROR: Missing dag_dataset(3)_a7_a12.csv
+if not exist "dag_dataset3_a7_a12.csv" (
+    echo ERROR: Missing dag_dataset3_a7_a12.csv
     exit /b 1
 )
 

@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
+import torch   # added for tensor conversion
 
 
 def compute_schedule_metrics(
@@ -12,10 +13,8 @@ def compute_schedule_metrics(
 ) -> Tuple[float, float]:
     if finish_times.size == 0:
         return 0.0, 0.0
-
     makespan = float(np.max(finish_times))
     total_tardiness = float(np.maximum(0.0, finish_times - deadlines).sum())
-
     return makespan, total_tardiness
 
 
@@ -32,19 +31,14 @@ def _ready_tasks_from_obs(obs: Dict[str, np.ndarray]) -> List[int]:
         "node_mask",
         np.ones_like(obs["action_mask"]),
     ).astype(bool)
-
     action_mask = obs["action_mask"].astype(bool)
-
     num_cores = int(len(action_mask) // len(node_mask))
-
     ready = []
-
     for task in range(len(node_mask)):
         if node_mask[task] and action_mask[
             task * num_cores : (task + 1) * num_cores
         ].any():
             ready.append(task)
-
     return ready
 
 
@@ -54,41 +48,26 @@ def choose_action_random(
     rng: np.random.Generator,
 ) -> int:
     ready = _ready_tasks_from_obs(obs)
-
     if not ready:
         return 0
-
     task = int(rng.choice(ready))
     core = int(rng.integers(0, env.num_cores))
-
     return encode_action(task, core, env.num_cores)
 
 
 def choose_action_edf(env, obs: Dict[str, np.ndarray]) -> int:
     ready = _ready_tasks_from_obs(obs)
-
     if not ready:
         return 0
-
-    task = min(
-        ready,
-        key=lambda t: (
-            float(env.deadlines[t]),
-            int(t),
-        ),
-    )
-
+    task = min(ready, key=lambda t: (float(env.deadlines[t]), int(t)))
     core = env.best_core_for_task(task)
-
     return encode_action(task, core, env.num_cores)
 
 
 def choose_action_heft(env, obs: Dict[str, np.ndarray]) -> int:
     ready = _ready_tasks_from_obs(obs)
-
     if not ready:
         return 0
-
     task = max(
         ready,
         key=lambda t: (
@@ -97,9 +76,7 @@ def choose_action_heft(env, obs: Dict[str, np.ndarray]) -> int:
             -int(t),
         ),
     )
-
     core = env.best_core_for_task(task)
-
     return encode_action(task, core, env.num_cores)
 
 
@@ -108,12 +85,25 @@ def choose_action_from_sb3_model(
     obs: Dict[str, np.ndarray],
     deterministic: bool = True,
 ) -> int:
-    action, _ = model.predict(
-        obs,
-        deterministic=deterministic,
-    )
+    """
+    Predict action using a trained SB3 model (trained with vectorized env).
+    Converts observation to tensors, adds batch dimension, and calls policy.forward().
+    """
+    # Convert each numpy array to torch tensor and add batch dimension (1, ...)
+    obs_tensors = {}
+    for key, value in obs.items():
+        if isinstance(value, np.ndarray):
+            obs_tensors[key] = torch.as_tensor(value[None, ...], dtype=torch.float32)
+        else:
+            obs_tensors[key] = value
 
-    return int(action)
+    # Ensure action_mask is boolean (as expected by policy)
+    if "action_mask" in obs_tensors:
+        obs_tensors["action_mask"] = obs_tensors["action_mask"].bool()
+
+    with torch.no_grad():
+        actions, _, _ = model.policy.forward(obs_tensors, deterministic=deterministic)
+    return int(actions[0].item())
 
 
 def run_policy_episode(
@@ -123,7 +113,6 @@ def run_policy_episode(
     model=None,
 ):
     obs, info = env.reset()
-
     terminated = False
     truncated = False
     total_reward = 0.0
@@ -133,35 +122,15 @@ def run_policy_episode(
         if policy_name == "RANDOM":
             if rng is None:
                 rng = np.random.default_rng()
-
-            action = choose_action_random(
-                env,
-                obs,
-                rng,
-            )
-
+            action = choose_action_random(env, obs, rng)
         elif policy_name == "EDF":
-            action = choose_action_edf(
-                env,
-                obs,
-            )
-
+            action = choose_action_edf(env, obs)
         elif policy_name == "HEFT":
-            action = choose_action_heft(
-                env,
-                obs,
-            )
-
+            action = choose_action_heft(env, obs)
         elif policy_name in {"PPO_GAT", "GAT_PPO"}:
             if model is None:
                 raise ValueError("model is required for PPO_GAT evaluation.")
-
-            action = choose_action_from_sb3_model(
-                model,
-                obs,
-                deterministic=True,
-            )
-
+            action = choose_action_from_sb3_model(model, obs, deterministic=True)
         else:
             raise ValueError(f"Unknown policy_name: {policy_name}")
 
@@ -176,12 +145,10 @@ def run_policy_episode(
                     **step_info,
                 }
             )
-
         obs = next_obs
 
     assigned, start, finish = env.get_schedule()
     metrics = env.get_metrics()
-
     return assigned, start, finish, metrics, total_reward, step_rows
 
 
@@ -192,9 +159,7 @@ def validate_heft_inputs(
 ) -> None:
     if not nx.is_directed_acyclic_graph(G):
         raise ValueError("Input graph must be a DAG.")
-
     if exec_times.ndim != 2 or exec_times.shape[1] < 2:
         raise ValueError("exec_times must have shape (num_tasks, >=2).")
-
     if any(p not in (0, 1) for p in processor_map):
         raise ValueError("processor_map values must be 0=A7 or 1=A12.")

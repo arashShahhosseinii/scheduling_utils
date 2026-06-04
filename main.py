@@ -10,7 +10,7 @@ import pandas as pd
 from stable_baselines3 import PPO
 
 from Dag_Env import DagSchedulingEnv
-from gat_sb3_policy import MaskedGATActorCriticPolicy
+from gat_sb3_policy import MaskedMLPActorCriticPolicy
 from scheduling_utils import run_policy_episode
 
 
@@ -20,15 +20,16 @@ except NameError:
     SCRIPT_DIR = Path(sys.argv[0]).resolve().parent
 
 
+# Use the renamed CSV files
 DATASET_PATHS = [
-    SCRIPT_DIR / "dag_dataset(1)_a7_a12.csv",
-    SCRIPT_DIR / "dag_dataset(2)_a7_a12.csv",
-    SCRIPT_DIR / "dag_dataset(3)_a7_a12.csv",
+    SCRIPT_DIR / "dag_dataset1_a7_a12.csv",
+    SCRIPT_DIR / "dag_dataset2_a7_a12.csv",
+    SCRIPT_DIR / "dag_dataset3_a7_a12.csv",
 ]
 
 
 ARTIFACT_DIR = SCRIPT_DIR / "artifacts"
-MODEL_PATH = ARTIFACT_DIR / "models" / "ppo_gat_scheduler.zip"
+MODEL_PATH = ARTIFACT_DIR / "models" / "ppo_mlp_scheduler.zip"
 EVAL_DIR = ARTIFACT_DIR / "evaluation"
 
 EVAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -38,9 +39,10 @@ SEED = 42
 
 PROCESSOR_MAP = [0, 1]
 
-# New reward weights:
-# reward = -(0.5 * delta_energy + 0.5 * delta_makespan)
 REWARD_WEIGHTS = (0.5, 0.5)
+
+# Force max_tasks = 108 to match the trained model's action space
+FORCED_MAX_TASKS = 108
 
 
 def build_env(
@@ -55,9 +57,9 @@ def build_env(
         reward_weights=REWARD_WEIGHTS,
         invalid_action_penalty=2.0,
         sample_dags=sample_dags,
+        max_tasks=FORCED_MAX_TASKS,   # force to 108
         seed=SEED,
     )
-
     return env
 
 
@@ -68,19 +70,21 @@ def evaluate() -> pd.DataFrame:
             "First train it with: python train_ppo_gat.py"
         )
 
-    load_env = DagSchedulingEnv(
+    # Create a dummy env just to load the model (max_tasks must match the model)
+    dummy_env = DagSchedulingEnv(
         csv_paths=DATASET_PATHS,
         processor_map=PROCESSOR_MAP,
         reward_weights=REWARD_WEIGHTS,
+        max_tasks=FORCED_MAX_TASKS,
         sample_dags=False,
         seed=SEED,
     )
 
     model = PPO.load(
         str(MODEL_PATH),
-        env=load_env,
+        env=dummy_env,
         custom_objects={
-            "policy_class": MaskedGATActorCriticPolicy,
+            "policy_class": MaskedMLPActorCriticPolicy,
         },
     )
 
@@ -131,7 +135,7 @@ def save_plots(summary: pd.DataFrame) -> None:
     fig1, ax1 = plt.subplots(figsize=(9, 5))
     ax1.bar(methods, summary["makespan_mean"].tolist())
     ax1.set_ylabel("Mean Makespan")
-    ax1.set_title("GAT+PPO vs HEFT: QoS / Makespan")
+    ax1.set_title("PPO+MLP vs HEFT: Makespan")
     ax1.grid(axis="y", linestyle="--", alpha=0.5)
     fig1.tight_layout()
     fig1.savefig(EVAL_DIR / "makespan_comparison.png", dpi=180)
@@ -139,20 +143,18 @@ def save_plots(summary: pd.DataFrame) -> None:
     fig2, ax2 = plt.subplots(figsize=(9, 5))
     ax2.bar(methods, summary["total_energy_mean"].tolist())
     ax2.set_ylabel("Mean Total Energy")
-    ax2.set_title("GAT+PPO vs HEFT: Energy")
+    ax2.set_title("PPO+MLP vs HEFT: Energy")
     ax2.grid(axis="y", linestyle="--", alpha=0.5)
     fig2.tight_layout()
     fig2.savefig(EVAL_DIR / "energy_comparison.png", dpi=180)
 
 
 def main() -> None:
+    print(f"Forcing max_tasks = {FORCED_MAX_TASKS} to match trained model.")
     detail = evaluate()
 
     detail_path = EVAL_DIR / "comparison_detail.csv"
-    detail.to_csv(
-        detail_path,
-        index=False,
-    )
+    detail.to_csv(detail_path, index=False)
 
     summary = (
         detail.groupby("method", as_index=False)
@@ -168,10 +170,7 @@ def main() -> None:
     )
 
     summary_path = EVAL_DIR / "comparison_summary.csv"
-    summary.to_csv(
-        summary_path,
-        index=False,
-    )
+    summary.to_csv(summary_path, index=False)
 
     save_plots(summary)
 
