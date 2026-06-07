@@ -11,7 +11,7 @@ set ARTIFACT_DIR=artifacts
 set MODEL_DIR=artifacts\models
 set EVAL_DIR=artifacts\evaluation
 set LOG_DIR=artifacts\logs
-set MODEL_FILE=artifacts\models\ppo_mlp_scheduler.zip
+set MODEL_FILE=artifacts\models\ppo_gat_scheduler.zip
 
 if "%COMMAND%"=="run" goto run
 if "%COMMAND%"=="install" goto install

@@ -10,7 +10,7 @@ import pandas as pd
 from stable_baselines3 import PPO
 
 from Dag_Env import DagSchedulingEnv
-from gat_sb3_policy import MaskedMLPActorCriticPolicy
+from gat_sb3_policy import MaskedGATActorCriticPolicy
 from scheduling_utils import run_policy_episode
 
 
@@ -29,7 +29,7 @@ DATASET_PATHS = [
 
 
 ARTIFACT_DIR = SCRIPT_DIR / "artifacts"
-MODEL_PATH = ARTIFACT_DIR / "models" / "ppo_mlp_scheduler.zip"
+MODEL_PATH = ARTIFACT_DIR / "models" / "ppo_gat_scheduler.zip"
 EVAL_DIR = ARTIFACT_DIR / "evaluation"
 
 EVAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -84,7 +84,7 @@ def evaluate() -> pd.DataFrame:
         str(MODEL_PATH),
         env=dummy_env,
         custom_objects={
-            "policy_class": MaskedMLPActorCriticPolicy,
+            "policy_class": MaskedGATActorCriticPolicy,
         },
     )
 
@@ -135,7 +135,7 @@ def save_plots(summary: pd.DataFrame) -> None:
     fig1, ax1 = plt.subplots(figsize=(9, 5))
     ax1.bar(methods, summary["makespan_mean"].tolist())
     ax1.set_ylabel("Mean Makespan")
-    ax1.set_title("PPO+MLP vs HEFT: Makespan")
+    ax1.set_title("PPO+GAT vs HEFT: Makespan")
     ax1.grid(axis="y", linestyle="--", alpha=0.5)
     fig1.tight_layout()
     fig1.savefig(EVAL_DIR / "makespan_comparison.png", dpi=180)
@@ -143,7 +143,7 @@ def save_plots(summary: pd.DataFrame) -> None:
     fig2, ax2 = plt.subplots(figsize=(9, 5))
     ax2.bar(methods, summary["total_energy_mean"].tolist())
     ax2.set_ylabel("Mean Total Energy")
-    ax2.set_title("PPO+MLP vs HEFT: Energy")
+    ax2.set_title("PPO+GAT vs HEFT: Energy")
     ax2.grid(axis="y", linestyle="--", alpha=0.5)
     fig2.tight_layout()
     fig2.savefig(EVAL_DIR / "energy_comparison.png", dpi=180)

@@ -86,24 +86,33 @@ def choose_action_from_sb3_model(
     deterministic: bool = True,
 ) -> int:
     """
-    Predict action using a trained SB3 model (trained with vectorized env).
-    Converts observation to tensors, adds batch dimension, and calls policy.forward().
-    """
-    # Convert each numpy array to torch tensor and add batch dimension (1, ...)
-    obs_tensors = {}
-    for key, value in obs.items():
-        if isinstance(value, np.ndarray):
-            obs_tensors[key] = torch.as_tensor(value[None, ...], dtype=torch.float32)
-        else:
-            obs_tensors[key] = value
+    Predict an action with the custom PPO+GAT policy.
 
-    # Ensure action_mask is boolean (as expected by policy)
-    if "action_mask" in obs_tensors:
-        obs_tensors["action_mask"] = obs_tensors["action_mask"].bool()
+    This manual conversion intentionally accepts a variable padded edge count
+    during evaluation. Integer edge indices remain int64, masks remain boolean,
+    all continuous features become float32, and every tensor is moved to the
+    same device as the loaded policy.
+    """
+    device = model.policy.device
+    boolean_keys = {"edge_mask", "node_mask", "action_mask"}
+
+    obs_tensors: Dict[str, torch.Tensor] = {}
+    for key, value in obs.items():
+        array = np.asarray(value)
+        if key == "edge_index":
+            tensor = torch.as_tensor(array, dtype=torch.long, device=device)
+        elif key in boolean_keys:
+            tensor = torch.as_tensor(array, dtype=torch.bool, device=device)
+        else:
+            tensor = torch.as_tensor(array, dtype=torch.float32, device=device)
+        obs_tensors[key] = tensor.unsqueeze(0)
 
     with torch.no_grad():
-        actions, _, _ = model.policy.forward(obs_tensors, deterministic=deterministic)
-    return int(actions[0].item())
+        actions, _, _ = model.policy.forward(
+            obs_tensors,
+            deterministic=deterministic,
+        )
+    return int(actions.reshape(-1)[0].item())
 
 
 def run_policy_episode(
