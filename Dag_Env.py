@@ -29,23 +29,13 @@ class DagSchedulingEnv(gym.Env):
         global_features:  (6,)
         action_mask:      (max_tasks * num_cores,)
 
-    In this version:
-      - GAT provides graph-based state encoding.
-      - PPO is the decision maker.
-      - Reward is dense and given at each step.
-      - Reward uses ONLY:
-          1. delta energy
-          2. delta makespan
-
-    Reward formula:
-      R_t = -(
-          0.5 * delta_energy / energy_scale
-        + 0.5 * delta_makespan / time_scale
-      )
-
-    Important:
-      Tardiness is NOT used in reward.
-      Tardiness is only kept as an evaluation metric if needed.
+    Reward (QoS‑based):
+      For each finished task:
+        QoS = 1                          if Fi <= Di
+              (x*Di - Fi) / ((x-1)*Di)   if Di < Fi <= x*Di
+              0                          if Fi > x*Di
+      Then reward = QoS * (max_global_energy / actual_energy)   (Proposal A)
+                or QoS * exp(-actual_energy / max_global_energy) (Proposal B)
     """
 
     metadata = {"render_modes": ["human"]}
@@ -57,12 +47,14 @@ class DagSchedulingEnv(gym.Env):
         csv_paths: Optional[Sequence[Union[str, Path]]] = None,
         dag_records: Optional[Sequence[Tuple[Union[str, Path], int]]] = None,
         processor_map: Optional[List[int]] = None,
-        reward_weights: Tuple[float, float] = (0.5, 0.5),
+        reward_weights: Tuple[float, float] = (0.5, 0.5),   # kept for compatibility, not used
         invalid_action_penalty: float = 2.0,
         max_tasks: Optional[int] = None,
         max_edges: Optional[int] = None,
         sample_dags: bool = True,
         seed: Optional[int] = None,
+        qos_factor: float = 2.0,                 # new: x in the QoS formula
+        reward_proposal: str = "A",              # "A" or "B"
     ) -> None:
         super().__init__()
 
@@ -78,13 +70,19 @@ class DagSchedulingEnv(gym.Env):
         if any(p not in (0, 1) for p in self.processor_map):
             raise ValueError("processor_map values must be 0=A7 or 1=A12.")
 
-        # reward_weights = (energy_weight, makespan_weight)
-        self.wE, self.wM = map(float, reward_weights)
+        # reward_weights are no longer used, but kept for compatibility with old code
+        self.wE, self.wM = map(float, reward_weights)   # not used in reward
 
         self.invalid_action_penalty = float(invalid_action_penalty)
         self.sample_dags = bool(sample_dags)
         self._initial_seed = seed
         self.np_random = np.random.default_rng(seed)
+
+        # QoS parameters
+        self.qos_factor = float(qos_factor)          # x in the formula
+        self.reward_proposal = reward_proposal.upper()
+        if self.reward_proposal not in ("A", "B"):
+            raise ValueError("reward_proposal must be 'A' or 'B'")
 
         if dag_records is not None:
             self.dag_records = [(str(p), int(i)) for p, i in dag_records]
@@ -163,11 +161,15 @@ class DagSchedulingEnv(gym.Env):
         self.m_i = np.ones(1, dtype=np.float32)
         self.rank_u_raw = np.ones(1, dtype=np.float32)
 
+        # scaling factors (still used for normalising observations, not reward)
         self.time_scale = 1.0
         self.energy_scale = 1.0
         self.period_scale = 1.0
         self.mi_scale = 1.0
         self.rank_scale = 1.0
+
+        # new: global max energy for normalisation in reward
+        self.max_energy_global = 1.0
 
         self.done_mask: np.ndarray
         self.ready_mask: np.ndarray
@@ -224,6 +226,9 @@ class DagSchedulingEnv(gym.Env):
             self.exec_times,
             self.processor_map,
         ).astype(np.float32)
+
+        # compute global max energy for reward normalisation
+        self.max_energy_global = float(np.max(self.energy_mat)) if self.energy_mat.size else 1.0
 
         max_deadline = float(np.max(self.deadlines)) if self.deadlines.size else 1.0
         max_exec = float(np.max(self.exec_times)) if self.exec_times.size else 1.0
@@ -481,7 +486,6 @@ class DagSchedulingEnv(gym.Env):
 
         if not valid:
             obs = self._obs()
-
             return (
                 obs,
                 -self.invalid_action_penalty,
@@ -495,15 +499,14 @@ class DagSchedulingEnv(gym.Env):
             )
 
         prev_energy = self.total_energy
-        prev_makespan = self.makespan
+        prev_makespan = self.makespan      # <-- added to compute delta
 
         start, finish = self.estimate_start_finish(task, core)
 
         proc_type = self.processor_map[core]
         energy = float(self.energy_mat[task, proc_type])
 
-        # Tardiness is calculated only as a metric.
-        # It is NOT used in the reward.
+        # Tardiness is calculated only as a metric (not used in reward)
         tardiness = max(0.0, finish - float(self.deadlines[task]))
 
         self.assigned[task] = core
@@ -525,16 +528,44 @@ class DagSchedulingEnv(gym.Env):
         self.total_tardiness += tardiness
         self.makespan = max(self.makespan, finish)
 
-        delta_energy = self.total_energy - prev_energy
-        delta_makespan = self.makespan - prev_makespan
+        # ========== REWARD CALCULATION ==========
+        # 1. Compute QoS for this task
+        di = float(self.deadlines[task])
+        fi = finish
+        x = self.qos_factor
 
-        # New reward:
-        # Only delta energy and delta makespan are used.
-        # Both coefficients are 0.5.
-        reward = -(
-            self.wE * delta_energy / max(self.energy_scale, 1e-6)
-            + self.wM * delta_makespan / max(self.time_scale, 1e-6)
-        )
+        if fi <= di:
+            qos = 1.0
+        elif fi <= x * di:
+            qos = (x * di - fi) / ((x - 1) * di)
+        else:
+            qos = 0.0
+
+        # 2. Energy term
+        max_e = self.max_energy_global
+        if max_e <= 0:
+            max_e = 1e-6
+
+        if self.reward_proposal == "A":
+            # reward = QoS * (max_global_energy / actual_energy)
+            energy_term = max_e / (energy + 1e-8)
+        else:   # proposal B
+            # reward = QoS * exp(-actual_energy / max_global_energy)
+            energy_term = np.exp(-energy / max_e)
+
+        reward = qos * energy_term
+
+        # 3. Makespan penalty (new)
+        delta_makespan = self.makespan - prev_makespan
+        makespan_penalty = 0.001 * (delta_makespan / self.time_scale)
+        reward = reward - makespan_penalty
+
+        # Optional clipping to prevent extreme values
+        reward = np.clip(reward, -10.0, 10.0)
+        # ===========================================
+
+        # For info logging, we still can store delta values if needed
+        delta_energy = self.total_energy - prev_energy
 
         terminated = bool(np.all(self.done_mask[: self.num_tasks]))
         obs = self._obs()
@@ -552,6 +583,8 @@ class DagSchedulingEnv(gym.Env):
             "makespan": self.makespan,
             "total_energy": self.total_energy,
             "total_tardiness": self.total_tardiness,
+            "qos": qos,
+            "reward_proposal": self.reward_proposal,
         }
 
         return obs, float(reward), terminated, False, info
