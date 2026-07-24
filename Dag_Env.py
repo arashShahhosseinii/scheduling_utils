@@ -168,8 +168,12 @@ class DagSchedulingEnv(gym.Env):
         self.mi_scale = 1.0
         self.rank_scale = 1.0
 
-        # new: global max energy for normalisation in reward
+        # global max per-task energy for reward normalisation
         self.max_energy_global = 1.0
+
+        # Denominator for graph-level energy normalisation:
+        # energy(DAG) / energy(max v-f)
+        self.max_vf_dag_energy = 1.0
 
         self.done_mask: np.ndarray
         self.ready_mask: np.ndarray
@@ -227,8 +231,28 @@ class DagSchedulingEnv(gym.Env):
             self.processor_map,
         ).astype(np.float32)
 
-        # compute global max energy for reward normalisation
-        self.max_energy_global = float(np.max(self.energy_mat)) if self.energy_mat.size else 1.0
+        # Compute energy normalisation values.
+        # self.energy_mat already stores the energy of each task at the selected
+        # maximum v-f entry for A7 and A12, as extracted in Create_Dag.py.
+        available_proc_types = sorted(set(self.processor_map))
+        available_energy = self.energy_mat[:, available_proc_types]
+
+        # Per-task maximum energy, used by the existing reward proposal A/B.
+        self.max_energy_global = (
+            float(np.max(available_energy))
+            if available_energy.size
+            else 1.0
+        )
+
+        # Graph-level maximum-v-f energy denominator:
+        # energy(max v-f) = sum over all DAG tasks of the largest available
+        # max-v-f energy value for that task.
+        self.max_vf_dag_energy = max(
+            float(np.sum(np.max(available_energy, axis=1)))
+            if available_energy.size
+            else 1.0,
+            1e-6,
+        )
 
         max_deadline = float(np.max(self.deadlines)) if self.deadlines.size else 1.0
         max_exec = float(np.max(self.exec_times)) if self.exec_times.size else 1.0
@@ -374,6 +398,10 @@ class DagSchedulingEnv(gym.Env):
 
         return x
 
+    def _normalized_dag_energy(self) -> float:
+        """Return graph energy as energy(DAG) / energy(max v-f)."""
+        return float(self.total_energy) / max(float(self.max_vf_dag_energy), 1e-6)
+
     def _edge_index_and_mask(self) -> Tuple[np.ndarray, np.ndarray]:
         edge_index = np.zeros((2, self.max_edges), dtype=np.int64)
         edge_mask = np.zeros(self.max_edges, dtype=np.int8)
@@ -412,7 +440,7 @@ class DagSchedulingEnv(gym.Env):
             [
                 self.steps / max(self.num_tasks, 1),
                 float(np.sum(self.done_mask[: self.num_tasks])) / max(self.num_tasks, 1),
-                self.total_energy / max(self.energy_scale * self.num_tasks, 1e-6),
+                self._normalized_dag_energy(),
                 self.total_tardiness / self.time_scale,
                 self.makespan / self.time_scale,
                 float(np.sum(self.ready_mask[: self.num_tasks])) / max(self.num_tasks, 1),
@@ -581,7 +609,9 @@ class DagSchedulingEnv(gym.Env):
             "delta_energy": delta_energy,
             "delta_makespan": delta_makespan,
             "makespan": self.makespan,
-            "total_energy": self.total_energy,
+            "total_energy": self._normalized_dag_energy(),
+            "total_energy_raw": self.total_energy,
+            "max_vf_dag_energy": self.max_vf_dag_energy,
             "total_tardiness": self.total_tardiness,
             "qos": qos,
             "reward_proposal": self.reward_proposal,
@@ -605,7 +635,9 @@ class DagSchedulingEnv(gym.Env):
         return {
             "makespan": float(self.makespan),
             "total_tardiness": float(self.total_tardiness),
-            "total_energy": float(self.total_energy),
+            "total_energy": self._normalized_dag_energy(),
+            "total_energy_raw": float(self.total_energy),
+            "max_vf_dag_energy": float(self.max_vf_dag_energy),
         }
 
     def render(self):
@@ -613,6 +645,7 @@ class DagSchedulingEnv(gym.Env):
             f"DAG={Path(self.current_record[0]).name}:{self.current_record[1]} "
             f"steps={self.steps}/{self.num_tasks} "
             f"makespan={self.makespan:.3f} "
-            f"energy={self.total_energy:.3f} "
+            f"energy={self._normalized_dag_energy():.6f} "
+            f"raw_energy={self.total_energy:.3f} "
             f"tardiness={self.total_tardiness:.3f}"
         )
