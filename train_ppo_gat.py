@@ -32,6 +32,7 @@ except NameError:
 
 SELECTED_DATASET_KEY = "dataset1"
 SELECTED_ROW_INDEX = 0
+REWARD_MODE = "QOS_ENERGY_ONLY"
 
 DATASETS = {
     "dataset1": SCRIPT_DIR / "dag_dataset1_a7_a12.csv",
@@ -131,7 +132,8 @@ def main() -> None:
     print(f"=== Reward proposal       = {REWARD_PROPOSAL} ===")
     print(
         "=== Reward formula        = "
-        "wE * [QoS * energy_term] - wM * [delta_makespan / rank_scale] ==="
+        "QoS * energy_term "
+        "(makespan excluded from reward) ==="
     )
     print()
 

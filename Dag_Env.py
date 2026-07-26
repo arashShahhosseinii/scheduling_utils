@@ -1102,18 +1102,13 @@ class DagSchedulingEnv(gym.Env):
             - previous_makespan
         )
 
-        makespan_penalty = (
-            delta_makespan
-            / max(
-                float(self.rank_scale),
-                1e-6,
-            )
-        )
+        # Ablation experiment:
+        # reward uses only QoS and energy.
+        # Makespan is still reported as a metric,
+        # but it is not part of the reward.
+        makespan_penalty = 0.0
 
-        reward = (
-            self.wE * energy_reward
-            - self.wM * makespan_penalty
-        )
+        reward = energy_reward
 
         reward = float(
             np.clip(
