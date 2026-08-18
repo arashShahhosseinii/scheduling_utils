@@ -2,88 +2,30 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-import networkx as nx
 import numpy as np
 import torch
 
 
-def compute_schedule_metrics(
-    finish_times: np.ndarray,
-    deadlines: np.ndarray,
-) -> Tuple[float, float]:
-    if finish_times.size == 0:
-        return 0.0, 0.0
-
-    makespan = float(
-        np.max(finish_times)
-    )
-
-    total_tardiness = float(
-        np.maximum(
-            0.0,
-            finish_times - deadlines,
-        ).sum()
-    )
-
-    return makespan, total_tardiness
+def encode_action(task: int, slot: int, num_action_slots: int) -> int:
+    return int(task * num_action_slots + slot)
 
 
-def encode_action(
-    task: int,
-    core: int,
-    num_cores: int,
-) -> int:
-    return int(
-        task * num_cores + core
-    )
+def decode_action(action: int, num_action_slots: int) -> Tuple[int, int]:
+    return int(action // num_action_slots), int(action % num_action_slots)
 
 
-def decode_action(
-    action: int,
-    num_cores: int,
-) -> Tuple[int, int]:
-    return (
-        int(action // num_cores),
-        int(action % num_cores),
-    )
+def valid_actions_from_obs(obs: Dict[str, np.ndarray]) -> np.ndarray:
+    mask = np.asarray(obs["action_mask"], dtype=bool)
+    return np.flatnonzero(mask)
 
 
-def _ready_tasks_from_obs(
-    obs: Dict[str, np.ndarray],
-) -> List[int]:
-    node_mask = obs.get(
-        "node_mask",
-        np.ones_like(
-            obs["action_mask"]
-        ),
-    ).astype(bool)
-
-    action_mask = obs[
-        "action_mask"
-    ].astype(bool)
-
-    num_cores = int(
-        len(action_mask)
-        // len(node_mask)
-    )
-
-    ready: List[int] = []
-
-    for task in range(
-        len(node_mask)
-    ):
-        task_actions = action_mask[
-            task * num_cores:
-            (task + 1) * num_cores
-        ]
-
-        if (
-            node_mask[task]
-            and task_actions.any()
-        ):
-            ready.append(task)
-
-    return ready
+def _ready_tasks_from_obs(env, obs: Dict[str, np.ndarray]) -> List[int]:
+    valid_actions = valid_actions_from_obs(obs)
+    tasks = {
+        decode_action(int(action), env.num_action_slots)[0]
+        for action in valid_actions
+    }
+    return sorted(task for task in tasks if 0 <= task < env.num_tasks)
 
 
 def choose_action_random(
@@ -91,282 +33,116 @@ def choose_action_random(
     obs: Dict[str, np.ndarray],
     rng: np.random.Generator,
 ) -> int:
-    ready = _ready_tasks_from_obs(
-        obs
-    )
+    valid_actions = valid_actions_from_obs(obs)
+    if valid_actions.size == 0:
+        raise RuntimeError("No valid action exists in a non-terminal state.")
+    return int(rng.choice(valid_actions))
 
+
+def choose_action_edf_gang(env, obs: Dict[str, np.ndarray]) -> int:
+    ready = _ready_tasks_from_obs(env, obs)
     if not ready:
-        return 0
-
-    task = int(
-        rng.choice(ready)
-    )
-
-    core = int(
-        rng.integers(
-            0,
-            env.num_cores,
-        )
-    )
-
-    return encode_action(
-        task,
-        core,
-        env.num_cores,
-    )
+        raise RuntimeError("EDF_GANG found no ready task.")
+    task = min(ready, key=lambda t: (float(env.deadlines[t]), int(t)))
+    slot = env.best_allocation_for_task(task)
+    return encode_action(task, slot, env.num_action_slots)
 
 
-def choose_action_edf(
-    env,
-    obs: Dict[str, np.ndarray],
-) -> int:
-    ready = _ready_tasks_from_obs(
-        obs
-    )
-
+def choose_action_heft_gang(env, obs: Dict[str, np.ndarray]) -> int:
+    """
+    Gang-aware HEFT-like baseline:
+      1) choose highest upward-rank ready task,
+      2) choose Gang composition with earliest finish,
+         tie-breaking on lower Gang energy.
+    """
+    ready = _ready_tasks_from_obs(env, obs)
     if not ready:
-        return 0
-
-    task = min(
-        ready,
-        key=lambda task_index: (
-            float(
-                env.deadlines[
-                    task_index
-                ]
-            ),
-            int(task_index),
-        ),
-    )
-
-    core = env.best_core_for_task(
-        task
-    )
-
-    return encode_action(
-        task,
-        core,
-        env.num_cores,
-    )
-
-
-def choose_action_heft(
-    env,
-    obs: Dict[str, np.ndarray],
-) -> int:
-    ready = _ready_tasks_from_obs(
-        obs
-    )
-
-    if not ready:
-        return 0
+        raise RuntimeError("HEFT_GANG found no ready task.")
 
     task = max(
         ready,
-        key=lambda task_index: (
-            float(
-                env.rank_u_raw[
-                    task_index
-                ]
-            ),
-            -float(
-                env.deadlines[
-                    task_index
-                ]
-            ),
-            -int(task_index),
+        key=lambda t: (
+            float(env.rank_u_raw[t]),
+            -float(env.deadlines[t]),
+            -int(t),
         ),
     )
-
-    core = env.best_core_for_task(
-        task
-    )
-
-    return encode_action(
-        task,
-        core,
-        env.num_cores,
-    )
+    slot = env.best_allocation_for_task(task)
+    return encode_action(task, slot, env.num_action_slots)
 
 
 def choose_action_from_sb3_model(
     model,
     obs: Dict[str, np.ndarray],
     deterministic: bool = True,
-    exploration_alpha: Optional[
-        float
-    ] = None,
+    exploration_alpha: Optional[float] = None,
 ) -> int:
-    """
-    Predict an action using the custom PPO+GAT policy.
-
-    When deterministic=False, the policy samples from its
-    exploration-aware distribution.
-    """
-
     if exploration_alpha is not None:
-        model.policy.set_exploration_alpha(
-            exploration_alpha
-        )
+        model.policy.set_exploration_alpha(float(exploration_alpha))
 
-    model.policy.set_training_mode(
-        False
-    )
-
+    model.policy.set_training_mode(False)
     device = model.policy.device
-
-    boolean_keys = {
-        "edge_mask",
-        "node_mask",
-        "action_mask",
-    }
-
-    observation_tensors: Dict[
-        str,
-        torch.Tensor,
-    ] = {}
+    boolean_keys = {"edge_mask", "node_mask", "action_mask"}
+    observation_tensors: Dict[str, torch.Tensor] = {}
 
     for key, value in obs.items():
         array = np.asarray(value)
-
         if key == "edge_index":
-            tensor = torch.as_tensor(
-                array,
-                dtype=torch.long,
-                device=device,
-            )
+            tensor = torch.as_tensor(array, dtype=torch.long, device=device)
         elif key in boolean_keys:
-            tensor = torch.as_tensor(
-                array,
-                dtype=torch.bool,
-                device=device,
-            )
+            tensor = torch.as_tensor(array, dtype=torch.bool, device=device)
         else:
-            tensor = torch.as_tensor(
-                array,
-                dtype=torch.float32,
-                device=device,
-            )
-
-        observation_tensors[key] = (
-            tensor.unsqueeze(0)
-        )
+            tensor = torch.as_tensor(array, dtype=torch.float32, device=device)
+        observation_tensors[key] = tensor.unsqueeze(0)
 
     with torch.no_grad():
-        actions, _, _ = (
-            model.policy.forward(
-                observation_tensors,
-                deterministic=deterministic,
-            )
+        actions, _, _ = model.policy.forward(
+            observation_tensors,
+            deterministic=deterministic,
         )
-
-    return int(
-        actions.reshape(-1)[0].item()
-    )
+    return int(actions.reshape(-1)[0].item())
 
 
 def run_policy_episode(
     env,
     policy_name: str,
-    rng: Optional[
-        np.random.Generator
-    ] = None,
+    rng: Optional[np.random.Generator] = None,
     model=None,
     ppo_deterministic: bool = True,
-    ppo_exploration_alpha: Optional[
-        float
-    ] = None,
+    ppo_exploration_alpha: Optional[float] = None,
 ):
-    observation, _ = env.reset()
-
+    obs, _ = env.reset()
     terminated = False
     truncated = False
     total_reward = 0.0
-    step_rows = []
+    step_rows: List[dict] = []
 
-    if (
-        policy_name
-        in {"PPO_GAT", "GAT_PPO"}
-    ):
-        if model is None:
-            raise ValueError(
-                "model is required for "
-                "PPO_GAT evaluation."
-            )
-
-        if ppo_exploration_alpha is not None:
-            model.policy.set_exploration_alpha(
-                ppo_exploration_alpha
-            )
-
-        model.policy.set_training_mode(
-            False
-        )
-
-    while not (
-        terminated or truncated
-    ):
-        if policy_name == "RANDOM":
+    normalized_name = policy_name.upper()
+    while not (terminated or truncated):
+        if normalized_name == "RANDOM_GANG":
             if rng is None:
-                rng = (
-                    np.random.default_rng()
-                )
-
-            action = choose_action_random(
-                env,
-                observation,
-                rng,
+                rng = np.random.default_rng()
+            action = choose_action_random(env, obs, rng)
+        elif normalized_name == "EDF_GANG":
+            action = choose_action_edf_gang(env, obs)
+        elif normalized_name in {"HEFT_GANG", "HEFT-GANG"}:
+            action = choose_action_heft_gang(env, obs)
+        elif normalized_name in {"PPO_GANG", "PPO+GAT+GANG", "PPO_GAT_GANG"}:
+            if model is None:
+                raise ValueError("model is required for PPO_GANG evaluation.")
+            action = choose_action_from_sb3_model(
+                model,
+                obs,
+                deterministic=ppo_deterministic,
+                exploration_alpha=ppo_exploration_alpha,
             )
-
-        elif policy_name == "EDF":
-            action = choose_action_edf(
-                env,
-                observation,
-            )
-
-        elif policy_name == "HEFT":
-            action = choose_action_heft(
-                env,
-                observation,
-            )
-
-        elif policy_name in {
-            "PPO_GAT",
-            "GAT_PPO",
-        }:
-            action = (
-                choose_action_from_sb3_model(
-                    model,
-                    observation,
-                    deterministic=(
-                        ppo_deterministic
-                    ),
-                    exploration_alpha=(
-                        ppo_exploration_alpha
-                    ),
-                )
-            )
-
         else:
-            raise ValueError(
-                f"Unknown policy_name: "
-                f"{policy_name}"
-            )
+            raise ValueError(f"Unknown policy_name: {policy_name}")
 
-        (
-            next_observation,
-            reward,
-            terminated,
-            truncated,
-            step_info,
-        ) = env.step(action)
-
+        next_obs, reward, terminated, truncated, step_info = env.step(action)
         total_reward += float(reward)
 
-        if not step_info.get(
-            "invalid_action",
-            False,
-        ):
+        if not step_info.get("invalid_action", False):
             step_rows.append(
                 {
                     "action": int(action),
@@ -374,51 +150,9 @@ def run_policy_episode(
                     **step_info,
                 }
             )
+        obs = next_obs
 
-        observation = next_observation
-
-    assigned, start, finish = (
-        env.get_schedule()
-    )
-
+    env.validate_schedule()
+    assigned, start, finish = env.get_schedule()
     metrics = env.get_metrics()
-
-    return (
-        assigned,
-        start,
-        finish,
-        metrics,
-        total_reward,
-        step_rows,
-    )
-
-
-def validate_heft_inputs(
-    graph: nx.DiGraph,
-    execution_times: np.ndarray,
-    processor_map: List[int],
-) -> None:
-    if not nx.is_directed_acyclic_graph(
-        graph
-    ):
-        raise ValueError(
-            "Input graph must be a DAG."
-        )
-
-    if (
-        execution_times.ndim != 2
-        or execution_times.shape[1] < 2
-    ):
-        raise ValueError(
-            "exec_times must have shape "
-            "(num_tasks, >=2)."
-        )
-
-    if any(
-        processor_type not in (0, 1)
-        for processor_type in processor_map
-    ):
-        raise ValueError(
-            "processor_map values must be "
-            "0=A7 or 1=A12."
-        )
+    return assigned, start, finish, metrics, total_reward, step_rows
