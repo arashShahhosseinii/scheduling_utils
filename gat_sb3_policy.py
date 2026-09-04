@@ -108,6 +108,7 @@ class GraphAttentionGangSchedulerNetwork(nn.Module):
         global_hidden_dim: int = 32,
         allocation_hidden_dim: int = 32,
         context_hidden_dim: int = 64,
+        graph_pool_dim: int = 128,
         actor_hidden_dim: int = 128,
         critic_hidden_dim: int = 128,
         dropout: float = 0.10,
@@ -155,10 +156,23 @@ class GraphAttentionGangSchedulerNetwork(nn.Module):
             ]
         )
 
-        self.graph_pool_gate = nn.Sequential(
-            nn.Linear(gat_hidden_dim, gat_hidden_dim),
-            nn.Tanh(),
-            nn.Linear(gat_hidden_dim, 1),
+        if graph_pool_dim <= 0:
+            raise ValueError("graph_pool_dim must be positive.")
+        self.graph_pool_dim = int(graph_pool_dim)
+
+        # Learnable graph pooling requested by the project supervisor:
+        #   1) masked mean over node embeddings
+        #   2) masked max over node embeddings
+        #   3) concatenate [mean || max]
+        #   4) trainable projection to graph_pool_dim (default: 128)
+        #
+        # With gat_hidden_dim=64, the concatenated statistics have size 128.
+        # The projection is still kept trainable so the network can learn how
+        # to mix mean- and max-based graph information before PPO consumes it.
+        self.graph_pool_projector = nn.Sequential(
+            nn.Linear(2 * gat_hidden_dim, self.graph_pool_dim),
+            nn.ReLU(),
+            nn.LayerNorm(self.graph_pool_dim),
         )
         self.core_encoder = nn.Sequential(
             nn.Linear(self.core_feature_dim, core_hidden_dim),
@@ -181,7 +195,7 @@ class GraphAttentionGangSchedulerNetwork(nn.Module):
         core_summary_dim = self.num_resource_types * core_hidden_dim
         self.context_encoder = nn.Sequential(
             nn.Linear(
-                gat_hidden_dim + core_summary_dim + global_hidden_dim,
+                self.graph_pool_dim + core_summary_dim + global_hidden_dim,
                 context_hidden_dim,
             ),
             nn.ReLU(),
@@ -200,7 +214,9 @@ class GraphAttentionGangSchedulerNetwork(nn.Module):
             nn.Linear(actor_hidden_dim, 1),
         )
 
-        critic_input_dim = gat_hidden_dim + core_summary_dim + global_hidden_dim
+        critic_input_dim = (
+            self.graph_pool_dim + core_summary_dim + global_hidden_dim
+        )
         self.value_head = nn.Sequential(
             nn.Linear(critic_input_dim, critic_hidden_dim),
             nn.ReLU(),
@@ -314,18 +330,42 @@ class GraphAttentionGangSchedulerNetwork(nn.Module):
             )
         node_embeddings = node_embeddings.reshape(batch_size, self.max_tasks, -1)
 
-        pool_logits = self.graph_pool_gate(node_embeddings).squeeze(-1)
-        pool_logits = pool_logits.masked_fill(~node_mask, -1e9)
-        pool_weights = torch.softmax(pool_logits, dim=1)
-        pool_weights = pool_weights * node_mask.to(pool_weights.dtype)
-        pool_weights = pool_weights / pool_weights.sum(
-            dim=1,
-            keepdim=True,
-        ).clamp_min(1e-8)
-        graph_embedding = torch.sum(
-            node_embeddings * pool_weights.unsqueeze(-1),
-            dim=1,
+        # ------------------------------------------------------------
+        # Learnable Mean + Max graph pooling
+        # ------------------------------------------------------------
+        # node_mask prevents padded/non-existent task slots from affecting
+        # either statistic. Shape conventions:
+        #   node_embeddings: [B, N, H]
+        #   node_mask      : [B, N]
+        #   masked_mean    : [B, H]
+        #   masked_max     : [B, H]
+        #   pooled_stats   : [B, 2H]
+        #   graph_embedding: [B, graph_pool_dim]
+        mask = node_mask.unsqueeze(-1)
+        mask_float = mask.to(node_embeddings.dtype)
+
+        valid_node_count = mask_float.sum(dim=1).clamp_min(1.0)
+        masked_sum = (node_embeddings * mask_float).sum(dim=1)
+        masked_mean = masked_sum / valid_node_count
+
+        # Invalid/padded nodes must never win the max operation.
+        # finfo.min is used instead of -inf to avoid propagating infinities
+        # into later dense layers in pathological inputs.
+        very_negative = torch.finfo(node_embeddings.dtype).min
+        masked_for_max = node_embeddings.masked_fill(~mask, very_negative)
+        masked_max = masked_for_max.max(dim=1).values
+
+        # Defensive fallback for a malformed observation containing no real
+        # nodes. A valid DAG should always contain at least one node.
+        has_real_node = node_mask.any(dim=1, keepdim=True)
+        masked_max = torch.where(
+            has_real_node,
+            masked_max,
+            torch.zeros_like(masked_max),
         )
+
+        pooled_stats = torch.cat([masked_mean, masked_max], dim=-1)
+        graph_embedding = self.graph_pool_projector(pooled_stats)
         return node_embeddings, graph_embedding, node_mask
 
     def _allocation_features(
@@ -449,6 +489,7 @@ class MaskedGATActorCriticPolicy(ActorCriticPolicy):
         global_hidden_dim: int = 32,
         allocation_hidden_dim: int = 32,
         context_hidden_dim: int = 64,
+        graph_pool_dim: int = 128,
         actor_hidden_dim: int = 128,
         critic_hidden_dim: int = 128,
         dropout: float = 0.10,
@@ -463,6 +504,7 @@ class MaskedGATActorCriticPolicy(ActorCriticPolicy):
         self.global_hidden_dim = int(global_hidden_dim)
         self.allocation_hidden_dim = int(allocation_hidden_dim)
         self.context_hidden_dim = int(context_hidden_dim)
+        self.graph_pool_dim = int(graph_pool_dim)
         self.actor_hidden_dim = int(actor_hidden_dim)
         self.critic_hidden_dim = int(critic_hidden_dim)
         self.dropout = float(dropout)
@@ -505,6 +547,7 @@ class MaskedGATActorCriticPolicy(ActorCriticPolicy):
             global_hidden_dim=self.global_hidden_dim,
             allocation_hidden_dim=self.allocation_hidden_dim,
             context_hidden_dim=self.context_hidden_dim,
+            graph_pool_dim=self.graph_pool_dim,
             actor_hidden_dim=self.actor_hidden_dim,
             critic_hidden_dim=self.critic_hidden_dim,
             dropout=self.dropout,
@@ -611,6 +654,7 @@ class MaskedGATActorCriticPolicy(ActorCriticPolicy):
                 "global_hidden_dim": self.global_hidden_dim,
                 "allocation_hidden_dim": self.allocation_hidden_dim,
                 "context_hidden_dim": self.context_hidden_dim,
+                "graph_pool_dim": self.graph_pool_dim,
                 "actor_hidden_dim": self.actor_hidden_dim,
                 "critic_hidden_dim": self.critic_hidden_dim,
                 "dropout": self.dropout,

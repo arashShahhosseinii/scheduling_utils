@@ -26,11 +26,12 @@ SEED = 42
 # m_i is confirmed to be the exact number of cores that task i
 # needs simultaneously.
 # Since m_i is generated in [1, 6], using 6 A7 + 6 A12 cores
-# makes every possible homogeneous or mixed gang composition feasible.
+# guarantees that every task can be scheduled as a homogeneous gang:
+# either m_i A7 cores or m_i A12 cores. Mixed A7/A12 gangs are disabled.
 NUM_A7_CORES = 6
 NUM_A12_CORES = 6
 MAX_GANG_SIZE = 6
-ALLOW_MIXED_GANGS = True
+ALLOW_MIXED_GANGS = False
 
 # Runtime model:
 #   "perfect_linear_speedup"

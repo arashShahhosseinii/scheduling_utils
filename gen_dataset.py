@@ -50,6 +50,16 @@ EDGE_PROB_RANGES: Sequence[Tuple[float, float]] = (
 )
 DEADLINE_FACTOR = 1.15
 M_I_VALUES = (1, 2, 3, 4, 5, 6)
+# Symmetric Binomial(n=5, p=0.5) probabilities mapped from X=0..5 to m_i=1..6.
+# The binomial coefficients are C(5, k) = [1, 5, 10, 10, 5, 1].
+# Normalized probabilities are therefore:
+#   m_i=1:  1/32 =  3.125%
+#   m_i=2:  5/32 = 15.625%
+#   m_i=3: 10/32 = 31.250%
+#   m_i=4: 10/32 = 31.250%
+#   m_i=5:  5/32 = 15.625%
+#   m_i=6:  1/32 =  3.125%
+M_I_BINOMIAL_WEIGHTS = (1, 5, 10, 10, 5, 1)
 SEED = 42
 
 
@@ -252,6 +262,26 @@ def build_vf_levels(a7_task: dict, a12_task: dict) -> List[dict]:
     return levels
 
 
+def sample_m_i_binomial(rng: random.Random) -> int:
+    """
+    Sample m_i from a symmetric Binomial(n=5, p=0.5) distribution.
+
+    We map X in {0, 1, 2, 3, 4, 5} to m_i = X + 1, so the
+    probabilities over m_i in {1, 2, 3, 4, 5, 6} are proportional to
+    the binomial coefficients [1, 5, 10, 10, 5, 1].
+
+    Using the caller-provided ``random.Random`` instance preserves the
+    project's deterministic behavior under the configured SEED.
+    """
+    return int(
+        rng.choices(
+            population=M_I_VALUES,
+            weights=M_I_BINOMIAL_WEIGHTS,
+            k=1,
+        )[0]
+    )
+
+
 def generate_node_characteristics(
     num_subtasks: int,
     paired_data: Sequence[dict],
@@ -282,7 +312,7 @@ def generate_node_characteristics(
                 "benchmark_name": pair["benchmark_name"],
                 "period": 1,
                 "implicit_deadline": fastest_local_time * DEADLINE_FACTOR,
-                "m_i": int(rng.choice(M_I_VALUES)),
+                "m_i": sample_m_i_binomial(rng),
                 "v_f_levels": vf_levels,
             }
         )

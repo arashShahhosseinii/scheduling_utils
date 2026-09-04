@@ -312,6 +312,7 @@ def main() -> None:
             "global_hidden_dim": 32,
             "allocation_hidden_dim": 32,
             "context_hidden_dim": 64,
+            "graph_pool_dim": 128,
             "actor_hidden_dim": 128,
             "critic_hidden_dim": 128,
             "dropout": 0.10,
